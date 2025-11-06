@@ -662,12 +662,11 @@ def extract_cell_text(img, cell):
 
         best_text = ""
         best_confidence = 0
-        best_method = ""
         attempts = 0
         successful_attempts = 0
 
         # First try all preprocessing methods with original orientation
-        for preprocess_name, processed_img in preprocessed_images:
+        for _preprocess_name, processed_img in preprocessed_images:
             for config in configs:
                 attempts += 1
                 try:
@@ -686,7 +685,9 @@ def extract_cell_text(img, cell):
                     # Calculate average confidence for non-empty words
                     confidences = [
                         conf
-                        for conf, word in zip(results["conf"], results["text"])
+                        for conf, word in zip(
+                            results["conf"], results["text"], strict=False
+                        )
                         if str(word).strip()
                     ]
                     avg_confidence = (
@@ -700,7 +701,6 @@ def extract_cell_text(img, cell):
                     if text and avg_confidence > best_confidence:
                         best_text = text
                         best_confidence = avg_confidence
-                        best_method = f"{preprocess_name}, angle 0, config {config}"
                 except Exception:
                     continue
 
@@ -761,7 +761,7 @@ def extract_cell_text(img, cell):
                     (cv2.rotate(processed_img, cv2.ROTATE_90_COUNTERCLOCKWISE), -90),
                 ]
 
-                for img_orient, angle in orientations:
+                for img_orient, _angle in orientations:
                     for config in configs:
                         attempts += 1
                         try:
@@ -798,9 +798,6 @@ def extract_cell_text(img, cell):
                             if text and avg_confidence > best_confidence:
                                 best_text = text
                                 best_confidence = avg_confidence
-                                best_method = (
-                                    f"{preprocess_name}, angle {angle}, config {config}"
-                                )
                         except Exception:
                             continue
 

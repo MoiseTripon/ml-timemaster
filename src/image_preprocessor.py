@@ -50,7 +50,7 @@ class ImagePreprocessor:
                 print(f"Converted PDF to image: {first_page.size}")
             return temp_path
         except Exception as e:
-            raise ValueError(f"Error converting PDF to image: {str(e)}")
+            raise ValueError(f"Error converting PDF to image: {str(e)}") from e
 
     def is_blank_image(self, img):
         """
@@ -126,7 +126,7 @@ class ImagePreprocessor:
 
             return preprocessed_path, img
         except Exception as e:
-            raise ValueError(f"Error preprocessing file: {str(e)}")
+            raise ValueError(f"Error preprocessing file: {str(e)}") from e
         finally:
             if file_type == "pdf" and os.path.exists(img_path):
                 os.remove(img_path)

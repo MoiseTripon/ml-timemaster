@@ -24,9 +24,12 @@ class CellOCR:
         Initialize the CellOCR.
 
         Args:
-            rotation_confidence_threshold (float): Threshold below which rotations are attempted.
-            minimum_confidence_threshold (float): Minimum confidence required to accept text.
-            high_confidence_threshold (float): Threshold above which text is immediately accepted.
+            rotation_confidence_threshold (float): Threshold below which
+                rotations are attempted.
+            minimum_confidence_threshold (float): Minimum confidence required
+                to accept text.
+            high_confidence_threshold (float): Threshold above which text is
+                immediately accepted.
         """
         self.rotation_confidence_threshold = rotation_confidence_threshold
         self.minimum_confidence_threshold = minimum_confidence_threshold
@@ -38,11 +41,16 @@ class CellOCR:
         # OCR configurations to try
         self.configs = [
             "--oem 3 --psm 6",  # Assume uniform block of text - good for paragraphs
-            "--oem 3 --psm 7",  # Treat the image as a single text line - good for headers
-            "--oem 3 --psm 8",  # Treat the image as a single word - good for short labels
-            "--oem 3 --psm 4",  # Assume a single column of text - good for multi-line cells
-            "--oem 3 --psm 11",  # Sparse text - find as much text as possible in complex layouts
-            "--oem 3 --psm 13",  # Treat the image as a raw line with default OEM - good fallback
+            # Treat the image as a single text line - good for headers
+            "--oem 3 --psm 7",
+            # Treat the image as a single word - good for short labels
+            "--oem 3 --psm 8",
+            # Assume a single column of text - good for multi-line cells
+            "--oem 3 --psm 4",
+            # Sparse text - find as much text as possible in complex layouts
+            "--oem 3 --psm 11",
+            # Treat the image as a raw line with default OEM - good fallback
+            "--oem 3 --psm 13",
         ]
 
     def _preprocess_cell_image(self, gray_img):
@@ -126,7 +134,7 @@ class CellOCR:
             # Calculate average confidence for non-empty words
             confidences = [
                 conf
-                for conf, word in zip(results["conf"], results["text"])
+                for conf, word in zip(results["conf"], results["text"], strict=False)
                 if str(word).strip()
             ]
             avg_confidence = sum(confidences) / len(confidences) if confidences else 0
@@ -197,7 +205,8 @@ class CellOCR:
 
     def extract_cell_text(self, img, cell):
         """
-        Extracts text from a cell using OCR, attempting different orientations and preprocessing methods.
+        Extracts text from a cell using OCR, attempting different orientations
+        and preprocessing methods.
 
         Args:
             img (numpy.ndarray): Full image containing the cell.
@@ -228,13 +237,12 @@ class CellOCR:
 
             best_text = ""
             best_confidence = 0
-            best_method = ""
             attempts = 0
             successful_attempts = 0
             consecutive_low_confidence = 0  # Track consecutive low confidence attempts
 
             # First try all preprocessing methods with original orientation
-            for preprocess_name, processed_img in preprocessed_images:
+            for _preprocess_name, processed_img in preprocessed_images:
                 for config in self.configs:
                     attempts += 1
                     text, avg_confidence = self._try_ocr_with_config(
@@ -254,9 +262,9 @@ class CellOCR:
                     if text and avg_confidence >= self.high_confidence_threshold:
                         best_text = text
                         best_confidence = avg_confidence
-                        best_method = f"{preprocess_name}, angle 0, config {config}"
                         print(
-                            f"{cell_id}: HIGH CONFIDENCE ({avg_confidence:.1f}%) - '{best_text}'"
+                            f"{cell_id}: HIGH CONFIDENCE ({avg_confidence:.1f}%) "
+                            f"- '{best_text}'"
                         )
                         return self._post_process_text(best_text).strip()
 
@@ -264,7 +272,6 @@ class CellOCR:
                     if text and avg_confidence > best_confidence:
                         best_text = text
                         best_confidence = avg_confidence
-                        best_method = f"{preprocess_name}, angle 0, config {config}"
 
                     # Early exit if two consecutive attempts have confidence below 50%
                     if (
@@ -272,7 +279,8 @@ class CellOCR:
                         >= self.consecutive_low_confidence_threshold
                     ):
                         print(
-                            f"{cell_id}: EMPTY (2+ consecutive attempts below 50% confidence)"
+                            f"{cell_id}: EMPTY (2+ consecutive attempts below 50% "
+                            "confidence)"
                         )
                         return ""
 
@@ -317,7 +325,7 @@ class CellOCR:
                         ),
                     ]
 
-                    for img_orient, angle in orientations:
+                    for img_orient, _angle in orientations:
                         for config in self.configs:
                             attempts += 1
                             text, avg_confidence = self._try_ocr_with_config(
@@ -331,11 +339,9 @@ class CellOCR:
                             if text and avg_confidence > best_confidence:
                                 best_text = text
                                 best_confidence = avg_confidence
-                                best_method = (
-                                    f"{preprocess_name}, angle {angle}, config {config}"
-                                )
 
-            # If no text was found with confidence-based approach, try a simpler approach
+            # If no text was found with confidence-based approach, try a simpler
+            # approach
             if not best_text:
                 for config in self.configs:
                     try:
@@ -345,7 +351,6 @@ class CellOCR:
                             estimated_confidence = 40.0
                             best_text = text
                             best_confidence = estimated_confidence
-                            best_method = f"direct OCR, config {config}"
                             break
                     except Exception:
                         continue
@@ -353,7 +358,8 @@ class CellOCR:
             # Check if the best confidence meets the minimum threshold
             if best_confidence < self.minimum_confidence_threshold:
                 print(
-                    f"{cell_id}: No text (confidence {best_confidence:.1f}% below threshold)"
+                    f"{cell_id}: No text (confidence {best_confidence:.1f}% "
+                    "below threshold)"
                 )
                 return ""
 
