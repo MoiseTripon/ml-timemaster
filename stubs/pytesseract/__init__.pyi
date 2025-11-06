@@ -13,7 +13,6 @@ def image_to_data(
     config: Optional[str] = ...,
     output_type: int = ...,
 ) -> Dict[str, List[str]]: ...
-
 def image_to_string(
     image: Any,
     *,

@@ -333,7 +333,9 @@ class CellOCR:
                             best_text = text
                             best_confidence = estimated_confidence
                             break
-                    except Exception:  # FIXED: Changed from bare except to except Exception
+                    except (
+                        Exception
+                    ):  # FIXED: Changed from bare except to except Exception
                         continue
 
             # Check if the best confidence meets the minimum threshold
