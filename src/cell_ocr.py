@@ -228,7 +228,6 @@ class CellOCR:
 
             best_text = ""
             best_confidence = 0
-            best_method = ""
             attempts = 0
             successful_attempts = 0
             consecutive_low_confidence = 0  # Track consecutive low confidence attempts
@@ -254,7 +253,6 @@ class CellOCR:
                     if text and avg_confidence >= self.high_confidence_threshold:
                         best_text = text
                         best_confidence = avg_confidence
-                        best_method = f"{preprocess_name}, angle 0, config {config}"
                         print(
                             f"{cell_id}: HIGH CONFIDENCE ({avg_confidence:.1f}%) - '{best_text}'"
                         )
@@ -264,7 +262,6 @@ class CellOCR:
                     if text and avg_confidence > best_confidence:
                         best_text = text
                         best_confidence = avg_confidence
-                        best_method = f"{preprocess_name}, angle 0, config {config}"
 
                     # Early exit if two consecutive attempts have confidence below 50%
                     if (
@@ -331,9 +328,6 @@ class CellOCR:
                             if text and avg_confidence > best_confidence:
                                 best_text = text
                                 best_confidence = avg_confidence
-                                best_method = (
-                                    f"{preprocess_name}, angle {angle}, config {config}"
-                                )
 
             # If no text was found with confidence-based approach, try a simpler approach
             if not best_text:
@@ -345,7 +339,6 @@ class CellOCR:
                             estimated_confidence = 40.0
                             best_text = text
                             best_confidence = estimated_confidence
-                            best_method = f"direct OCR, config {config}"
                             break
                     except Exception:
                         continue

@@ -651,7 +651,6 @@ def extract_cell_text(img, cell):
 
         best_text = ""
         best_confidence = 0
-        best_method = ""
         attempts = 0
         successful_attempts = 0
 
@@ -689,7 +688,6 @@ def extract_cell_text(img, cell):
                     if text and avg_confidence > best_confidence:
                         best_text = text
                         best_confidence = avg_confidence
-                        best_method = f"{preprocess_name}, angle 0, config {config}"
                 except Exception:
                     continue
 
@@ -783,9 +781,6 @@ def extract_cell_text(img, cell):
                             if text and avg_confidence > best_confidence:
                                 best_text = text
                                 best_confidence = avg_confidence
-                                best_method = (
-                                    f"{preprocess_name}, angle {angle}, config {config}"
-                                )
                         except Exception:
                             continue
 
