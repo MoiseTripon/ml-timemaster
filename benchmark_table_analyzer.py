@@ -1,11 +1,13 @@
 # benchmark_table_analyzer.py
+import csv
 import glob
 import time
-import csv
 from statistics import mean, median
+
 import cv2
 
-from src.table_analyzer import TableAnalyzer
+from src.table_analyzer import TableAnalyzer  # type: ignore
+
 
 def run_once(img, analyzer):
     t0 = time.perf_counter()
@@ -26,6 +28,7 @@ def run_once(img, analyzer):
         "rows": r,
         "cols": c,
     }
+
 
 def main():
     paths = sorted(glob.glob("test_images/*.*"))
@@ -51,12 +54,14 @@ def main():
     for path, img in imgs:
         metrics = run_once(img, analyzer)
         rows.append({"path": path, **metrics})
-        print(f"{path}: {metrics['t_total_ms']:.1f} ms, "
-              f"borders {metrics['t_borders_ms']:.1f} ms, "
-              f"cells {metrics['t_cells_ms']:.1f} ms, "
-              f"grid {metrics['t_grid_ms']:.1f} ms, "
-              f"cells {metrics['cells_after_dedupe']}, "
-              f"{metrics['rows']}x{metrics['cols']}")
+        print(
+            f"{path}: {metrics['t_total_ms']:.1f} ms, "
+            f"borders {metrics['t_borders_ms']:.1f} ms, "
+            f"cells {metrics['t_cells_ms']:.1f} ms, "
+            f"grid {metrics['t_grid_ms']:.1f} ms, "
+            f"cells {metrics['cells_after_dedupe']}, "
+            f"{metrics['rows']}x{metrics['cols']}"
+        )
 
     totals = [r["t_total_ms"] for r in rows]
     print("\n=== Summary ===")
@@ -72,6 +77,7 @@ def main():
         w.writeheader()
         w.writerows(rows)
     print(f"Wrote results to {out_csv}")
+
 
 if __name__ == "__main__":
     main()
