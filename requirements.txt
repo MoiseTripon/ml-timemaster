@@ -1,0 +1,10 @@
+# Core linting and formatting tools
+black
+ruff
+isort
+
+# Type checking
+mypy
+
+# Testing
+pytest
