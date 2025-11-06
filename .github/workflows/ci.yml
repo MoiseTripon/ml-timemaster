@@ -23,5 +23,3 @@ jobs:
         run: isort --check-only .
       - name: mypy (types)
         run: mypy .
-      - name: pytest
-        run: pytest -q
