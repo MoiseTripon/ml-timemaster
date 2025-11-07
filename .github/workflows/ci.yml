@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.head_ref }} # Checkout PR branch
+          ref: ${{ github.head_ref }}
 
       - uses: actions/setup-python@v5
         with:
