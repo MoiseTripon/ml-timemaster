@@ -1,0 +1,51 @@
+name: Remove File from All Branches
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_to_remove:
+        description: "File path to remove from tracking"
+        required: true
+        default: "start.py"
+
+jobs:
+  update-branches:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+      - name: Update all branches
+        run: |
+          FILE="${{ github.event.inputs.file_to_remove }}"
+          DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD | sed 's@^refs/remotes/origin/@@')
+
+          for branch in $(git branch -r | grep -v HEAD | sed 's/origin\///'); do
+            echo "Processing branch: $branch"
+            git checkout -B "$branch" "origin/$branch"
+            
+            # Try to merge the default branch
+            if ! git merge "origin/$DEFAULT_BRANCH" --no-edit; then
+              # Handle conflicts
+              if git status --porcelain | grep -qE "DU|UD" | grep "$FILE"; then
+                git rm --cached "$FILE" 2>/dev/null || true
+                git add -u
+                git commit --no-edit || true
+              fi
+            fi
+            
+            # Remove file if still tracked
+            if git ls-files --error-unmatch "$FILE" 2>/dev/null; then
+              git rm --cached "$FILE"
+              git commit -m "Remove $FILE from tracking"
+            fi
+            
+            git push origin "$branch" --force-with-lease
+          done
