@@ -12,6 +12,9 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }} # Checkout PR branch
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
