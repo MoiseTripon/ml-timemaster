@@ -1,7 +1,17 @@
+# Core image processing and OCR
 opencv-python
-numpy
 pytesseract
-Pillow
-matplotlib
 pdf2image
+numpy
+matplotlib
+
+# Core linting and formatting tools
+black
+ruff
+isort
+
+# Type checking
+mypy
+
+# Testing
 pytest
