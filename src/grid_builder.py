@@ -21,33 +21,42 @@ def organize_cells_into_grid(cells):
             - num_rows (int): Number of rows in the grid
             - num_cols (int): Number of columns in the grid
     """
+    logger.info("="*50)
+    logger.info("Starting grid organization")
+    logger.info(f"Input: {len(cells)} cells")
+    
     if not cells:
+        logger.warning("No cells to organize")
         return [], 0, 0
 
-    # Sort cells by position (top to bottom, left to right)
+    # Log all input cells
+    for i, cell in enumerate(cells):
+        logger.debug(
+            f"Input cell {i}: bounds={cell['bounds']}, text='{cell.get('text', '')[:30]}...'"
+        )
+
+    # Sort cells by position
     sorted_cells = sorted(cells, key=lambda c: (c["bounds"]["y1"], c["bounds"]["x1"]))
+    
+    # Find unique positions
+    tolerance = 5
+    
+    row_positions_raw = [cell["bounds"]["y1"] for cell in sorted_cells]
+    col_positions_raw = [cell["bounds"]["x1"] for cell in sorted_cells]
+    
+    logger.debug(f"Raw row positions: {sorted(set(row_positions_raw))}")
+    logger.debug(f"Raw col positions: {sorted(set(col_positions_raw))}")
 
-    # Find unique row and column positions with tolerance
-    tolerance = 5  # 5 pixels tolerance for row/column alignment
-
-    def merge_close_positions(positions, tolerance):
-        """Merge positions that are very close to each other."""
-        if not positions:
-            return []
-        positions = sorted(positions)
-        merged = [positions[0]]
-        for pos in positions[1:]:
-            if pos - merged[-1] > tolerance:
-                merged.append(pos)
-        return merged
-
-    # Get unique positions and merge those that are very close
     row_positions = merge_close_positions(
-        list(set(cell["bounds"]["y1"] for cell in sorted_cells)), tolerance
+        list(set(row_positions_raw)), tolerance
     )
     col_positions = merge_close_positions(
-        list(set(cell["bounds"]["x1"] for cell in sorted_cells)), tolerance
+        list(set(col_positions_raw)), tolerance
     )
+    
+    logger.info(f"Merged row positions ({len(row_positions)}): {row_positions}")
+    logger.info(f"Merged col positions ({len(col_positions)}): {col_positions}")
+
 
     # Calculate typical column width
     if len(col_positions) > 1:
@@ -179,4 +188,29 @@ def organize_cells_into_grid(cells):
     num_rows = len(final_grid)
     num_cols = max((len(row) for row in final_grid), default=0)
 
+    logger.info(f"Final grid: {num_rows} rows x {num_cols} cols")
+    
+    # Log grid structure
+    for row_idx, row in enumerate(final_grid):
+        logger.debug(f"Row {row_idx}: {len(row)} cells")
+        for col_idx, cell in enumerate(row):
+            if cell:
+                logger.debug(
+                    f"  [{row_idx},{col_idx}]: text='{cell.get('text', '')[:20]}...', "
+                    f"rowspan={cell.get('rowspan', 1)}, colspan={cell.get('colspan', 1)}"
+                )
+
     return final_grid, num_rows, num_cols
+
+def merge_close_positions(positions, tolerance):
+    """Merge positions that are very close to each other."""
+    if not positions:
+        return []
+    positions = sorted(positions)
+    merged = [positions[0]]
+    for pos in positions[1:]:
+        if pos - merged[-1] > tolerance:
+            merged.append(pos)
+        else:
+            logger.debug(f"Merging position {pos} with {merged[-1]} (diff={pos - merged[-1]})")
+    return merged

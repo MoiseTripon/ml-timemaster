@@ -1,6 +1,62 @@
 import datetime
 import logging
 import os
+import sys
+import argparse
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Table OCR Processor')
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode')
+    parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+                       default='INFO', help='Logging level')
+    parser.add_argument('--file', type=str, default='i_a.pdf', help='Input file path')
+    return parser.parse_args()
+
+# Configure logging BEFORE other imports
+def setup_logging(log_level=logging.DEBUG, log_to_file=True):
+    """Configure logging for the application."""
+    
+    # Create logs directory if it doesn't exist
+    if log_to_file and not os.path.exists("logs"):
+        os.makedirs("logs")
+    
+    # Create a timestamp for the log file
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Configure the root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level)
+    
+    # Clear any existing handlers
+    root_logger.handlers = []
+    
+    # Create formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
+    )
+    
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(log_level)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+    
+    # File handler
+    if log_to_file:
+        file_handler = logging.FileHandler(f"logs/table_detector_{timestamp}.log")
+        file_handler.setLevel(log_level)
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+    
+    return root_logger
+
+# Set up logging before importing other modules
+setup_logging(log_level=logging.DEBUG, log_to_file=True)
+
+
+import datetime
+import logging
+import os
 
 import cv2
 import matplotlib.pyplot as plt  # type: ignore
@@ -199,6 +255,14 @@ def debug_visualize_detection(img, table_bounds, cells):
 
 # Example usage
 if __name__ == "__main__":
+    args = parse_args()
+    log_level = getattr(logging, args.log_level)
+    setup_logging(log_level=log_level, log_to_file=args.debug)
+    if args.debug:
+            # Enable debug mode in table_detector
+            import src.table_detector as td
+            td.DEBUG_MODE = True
+            
     file_path = "i_a.pdf"  
     try:
         result = process_schedule_file(file_path)
