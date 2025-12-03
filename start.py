@@ -3,6 +3,8 @@ import logging
 import os
 import sys
 import argparse
+from src.performance_logger import PerformanceLogger
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Table OCR Processor')
@@ -87,7 +89,13 @@ def process_schedule_file(file_path):
         Exception: For other processing errors.
     """
     preprocessor = ImagePreprocessor()
-    ocr_processor = CellOCR()
+    verbose_logging = '--debug' in sys.argv or (hasattr(args, 'debug') and args.debug)
+    ocr_processor = CellOCR(verbose_logging=verbose_logging)
+    
+    # Create performance logger wrapper for the main logger
+    global logger
+    if not verbose_logging:
+        logger = PerformanceLogger(logging.getLogger(__name__))
     
     try:
         # Step 1: Preprocess the file
@@ -199,6 +207,8 @@ def process_schedule_file(file_path):
         plt.title(f"Detected Table and Cells ({num_rows}x{num_cols} grid)")
         plt.show()
 
+        if hasattr(logger, 'flush'):
+            logger.flush()
         return response
 
     except Exception as e:
