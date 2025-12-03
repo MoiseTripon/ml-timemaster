@@ -6,11 +6,8 @@ Contains the ImagePreprocessor class for image preprocessing operations.
 import logging
 import os
 import tempfile
-
 import cv2
 import pdf2image
-
-logger = logging.getLogger(__name__)
 
 
 class ImagePreprocessor:
@@ -24,13 +21,14 @@ class ImagePreprocessor:
         Initialize the ImagePreprocessor.
 
         Args:
-            dpi (int): DPI resolution for PDF to image conversion. Default is 500.
+            dpi (int): DPI resolution for PDF to image conversion.
         """
         self.dpi = dpi
+        self.logger = logging.getLogger(__name__)
 
     def convert_pdf_to_image(self, pdf_path):
         """
-        Converts a PDF file to a high-quality image.
+        Convert a PDF file to a high-quality image.
 
         Args:
             pdf_path (str): Path to the PDF file.
@@ -50,14 +48,14 @@ class ImagePreprocessor:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
                 temp_path = tmp.name
                 first_page.save(temp_path, "PNG", quality=95)
-                logger.info(f"Converted PDF to image: {first_page.size}")
+                self.logger.info(f"Converted PDF to image: {first_page.size}")
             return temp_path
         except Exception as e:
             raise ValueError(f"Error converting PDF to image: {str(e)}")
 
     def is_blank_image(self, img):
         """
-        Checks if an image is blank (mostly white).
+        Check if an image is blank (mostly white).
 
         Args:
             img (numpy.ndarray): Input image in BGR format.
@@ -66,24 +64,20 @@ class ImagePreprocessor:
             bool: True if the image is blank (>99% white), False otherwise.
         """
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        # Threshold to binary - pixels below 250 are considered content
         _, binary = cv2.threshold(gray, 250, 255, cv2.THRESH_BINARY_INV)
         non_white_pixels = cv2.countNonZero(binary)
         total_pixels = gray.shape[0] * gray.shape[1]
-        return non_white_pixels < total_pixels * 0.01  # more than 99% blank
+        return non_white_pixels < total_pixels * 0.01
 
     def preprocess(self, file_path):
         """
-        Preprocesses a schedule table from a PDF or image.
+        Preprocess a schedule table from a PDF or image.
 
         Args:
             file_path (str): Path to the PDF or image file.
 
         Returns:
             tuple: (preprocessed_path, processed_image, original_image)
-                - preprocessed_path (str): Path to the preprocessed image file
-                - processed_image (numpy.ndarray): Processed (binarized) image as numpy array
-                - original_image (numpy.ndarray): Original image as numpy array
 
         Raises:
             ValueError: If the file doesn't exist, can't be loaded, or is blank.
@@ -94,13 +88,12 @@ class ImagePreprocessor:
         file_type = "pdf" if file_path.lower().endswith(".pdf") else "image"
 
         if file_type == "pdf":
-            logger.info("Converting PDF to image...")
+            self.logger.info("Converting PDF to image...")
             img_path = self.convert_pdf_to_image(file_path)
         else:
             img_path = file_path
 
         try:
-            # Read image
             img = cv2.imread(img_path)
             if img is None:
                 raise ValueError("Failed to load image.")
@@ -108,20 +101,14 @@ class ImagePreprocessor:
             if self.is_blank_image(img):
                 raise ValueError("Error: The input image is blank.")
 
-            # Convert to grayscale
+            # Convert to grayscale and apply preprocessing
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-            # Apply adaptive thresholding
             binary = cv2.adaptiveThreshold(
                 gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 2
             )
-
-            # Denoise
             denoised = cv2.fastNlMeansDenoising(binary)
-
-            # Apply binarization after denoising
             _, binarized = cv2.threshold(
-                denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+                denoised,  0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
             )
 
             # Save preprocessed image

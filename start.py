@@ -3,175 +3,180 @@ import logging
 import os
 import sys
 import argparse
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+
+from src.image_preprocessor import ImagePreprocessor
+from src.table_detector import TableDetector
+from src.cell_ocr import CellOCR
+from src.grid_builder import GridBuilder
 from src.performance_logger import PerformanceLogger
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description='Table OCR Processor')
-    parser.add_argument('--debug', action='store_true', help='Enable debug mode')
-    parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
-                       default='INFO', help='Logging level')
-    parser.add_argument('--file', type=str, default='i_a.pdf', help='Input file path')
-    return parser.parse_args()
-
-# Configure logging BEFORE other imports
-def setup_logging(log_level=logging.DEBUG, log_to_file=True):
-    """Configure logging for the application."""
+class TableOCRProcessor:
+    """Main class for processing table OCR from PDF or image files."""
     
-    # Create logs directory if it doesn't exist
-    if log_to_file and not os.path.exists("logs"):
-        os.makedirs("logs")
-    
-    # Create a timestamp for the log file
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Configure the root logger
-    root_logger = logging.getLogger()
-    root_logger.setLevel(log_level)
-    
-    # Clear any existing handlers
-    root_logger.handlers = []
-    
-    # Create formatter
-    formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
-    )
-    
-    # Console handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(log_level)
-    console_handler.setFormatter(formatter)
-    root_logger.addHandler(console_handler)
-    
-    # File handler
-    if log_to_file:
-        file_handler = logging.FileHandler(f"logs/table_detector_{timestamp}.log")
-        file_handler.setLevel(log_level)
-        file_handler.setFormatter(formatter)
-        root_logger.addHandler(file_handler)
-    
-    return root_logger
+    def __init__(self, debug=False, log_level=logging.INFO):
+        """
+        Initialize the Table OCR Processor.
+        
+        Args:
+            debug (bool): Enable debug mode
+            log_level (int): Logging level
+        """
+        self.debug = debug
+        self.log_level = log_level
+        self.logger = self._setup_logging()
+        
+        # Initialize components
+        self.preprocessor = ImagePreprocessor()
+        self.table_detector = TableDetector(debug_mode=debug)
+        self.ocr_processor = CellOCR(verbose_logging=debug)
+        self.grid_builder = GridBuilder()
+        
+    def _setup_logging(self):
+        """Configure logging for the application."""
+        # Create logs directory if it doesn't exist
+        if self.debug and not os.path.exists("logs"):
+            os.makedirs("logs")
+        
+        # Create a timestamp for the log file
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Configure the root logger
+        root_logger = logging.getLogger()
+        root_logger.setLevel(self.log_level)
+        
+        # Clear any existing handlers
+        root_logger.handlers = []
+        
+        # Create formatter
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
+        )
+        
+        # Console handler
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(self.log_level)
+        console_handler.setFormatter(formatter)
+        root_logger.addHandler(console_handler)
+        
+        # File handler
+        if self.debug:
+            file_handler = logging.FileHandler(f"logs/table_detector_{timestamp}.log")
+            file_handler.setLevel(self.log_level)
+            file_handler.setFormatter(formatter)
+            root_logger.addHandler(file_handler)
+        
+        logger = logging.getLogger(__name__)
+        
+        # Wrap with performance logger if not in debug mode
+        if not self.debug:
+            logger = PerformanceLogger(logger)
+            
+        return logger
 
-# Set up logging before importing other modules
-setup_logging(log_level=logging.DEBUG, log_to_file=True)
+    def process_file(self, file_path):
+        """
+        Process a schedule file (PDF or image) and extract table data.
+        
+        Args:
+            file_path (str): Path to the PDF or image file to process.
+        
+        Returns:
+            dict: Comprehensive JSON structure with all table information
+        
+        Raises:
+            ValueError: If the file cannot be processed or no table is detected.
+        """
+        try:
+            # Step 1: Preprocess the file
+            self.logger.info(f"Processing file: {file_path}")
+            processed_path, processed_img, original_img = self.preprocessor.preprocess(file_path)
+            self.logger.info(f"Processed image size: {processed_img.shape}")
 
+            # Step 2: Detect table borders and cells
+            table_bounds = self.table_detector.detect_table_borders(processed_img)
+            cells = self.table_detector.detect_cells(processed_img, table_bounds)
+            
+            self.logger.info(f"Detected {len(cells)} cells")
 
-import datetime
-import logging
-import os
+            if len(cells) == 0:
+                self.logger.error("No cells detected in the table")
+                raise ValueError("No cells were detected in the table")
+            elif len(cells) == 1:
+                self.logger.warning("Only one cell detected - this might be the entire table")
+           
+            # Step 3: Extract text from each cell
+            result = {"table_bounds": table_bounds, "cells": []}
 
-import cv2
-import matplotlib.pyplot as plt  # type: ignore
-import numpy as np
+            for idx, cell in enumerate(cells):
+                try:
+                    text = self.ocr_processor.extract_cell_text(original_img, cell)
+                    cell_info = {
+                        "id": idx,
+                        "bounds": {
+                            "x1": cell["x1"],
+                            "y1": cell["y1"],
+                            "x2": cell["x2"],
+                            "y2": cell["y2"],
+                        },
+                        "dimensions": {"width": cell["width"], "height": cell["height"]},
+                        "text": text,
+                    }
+                    result["cells"].append(cell_info)
+                except Exception as ocr_error:
+                    self.logger.error(f"Error processing cell {idx}: {str(ocr_error)}")
 
-from src.cell_ocr import CellOCR
-from src.grid_builder import organize_cells_into_grid
-from src.image_preprocessor import ImagePreprocessor
-from src.table_detector import detect_cells, detect_table_borders
+            # Step 4: Organize cells into grid structure
+            grid, num_rows, num_cols = self.grid_builder.organize_cells_into_grid(result["cells"])
 
-logger = logging.getLogger(__name__)
-
-def process_schedule_file(file_path):
-    """
-    Processes a schedule file (PDF or image) and extracts table data.
-    
-    Args:
-        file_path (str): Path to the PDF or image file to process.
-    
-    Returns:
-        dict: Comprehensive JSON structure with all table information including:
-            - metadata: File information and processing timestamp
-            - table: Table bounds, dimensions, grid structure, and individual cells
-            - visualization: Information about the generated visualization file
-    
-    Raises:
-        ValueError: If the file cannot be processed or no table is detected.
-        Exception: For other processing errors.
-    """
-    preprocessor = ImagePreprocessor()
-    verbose_logging = '--debug' in sys.argv or (hasattr(args, 'debug') and args.debug)
-    ocr_processor = CellOCR(verbose_logging=verbose_logging)
-    
-    # Create performance logger wrapper for the main logger
-    global logger
-    if not verbose_logging:
-        logger = PerformanceLogger(logging.getLogger(__name__))
-    
-    try:
-        # Step 1: Preprocess the file
-        processed_path, processed_img, original_img = preprocessor.preprocess(file_path)
-        logger.info(f"Processed image size: {processed_img.shape}")
-
-        # Step 2: Detect table borders (using processed image)
-        table_bounds = detect_table_borders(processed_img)
-
-        # Step 3: Detect individual cells (using processed image)
-        cells = detect_cells(processed_img, table_bounds)
-
-        cells = detect_cells(processed_img, table_bounds)
-        logger.info(f"Detected {len(cells)} cells")
-
-        # Debug visualization
-        debug_visualize_detection(original_img, table_bounds, cells)
-
-        if len(cells) == 0:
-            logger.error("No cells detected in the table")
-            raise ValueError("No cells were detected in the table")
-        elif len(cells) == 1:
-            logger.warning("Only one cell detected - this might be the entire table")
-       
-        # Step 4: Extract text from each cell
-        result = {"table_bounds": table_bounds, "cells": []}
-
-        for idx, cell in enumerate(cells):
-            try:
-                # Extract text from cell using OCR processor (using original image for better OCR)
-                text = ocr_processor.extract_cell_text(original_img, cell)
-
-                # Add cell to result
-                cell_info = {
-                    "id": idx,
-                    "bounds": {
-                        "x1": cell["x1"],
-                        "y1": cell["y1"],
-                        "x2": cell["x2"],
-                        "y2": cell["y2"],
+            # Step 5: Create comprehensive response object
+            response = {
+                "metadata": {
+                    "file_name": os.path.basename(file_path),
+                    "file_type": "pdf" if file_path.lower().endswith(".pdf") else "image",
+                    "image_size": {
+                        "width": original_img.shape[1],
+                        "height": original_img.shape[0],
                     },
-                    "dimensions": {"width": cell["width"], "height": cell["height"]},
-                    "text": text,
-                }
-                result["cells"].append(cell_info)
-
-            except Exception as ocr_error:
-                logger.error(f"Error processing cell {idx}: {str(ocr_error)}")
-
-        # Step 5: Organize cells into grid structure
-        grid, num_rows, num_cols = organize_cells_into_grid(result["cells"])
-
-        # Step 6: Create comprehensive response object
-        response = {
-            "metadata": {
-                "file_name": os.path.basename(file_path),
-                "file_type": "pdf" if file_path.lower().endswith(".pdf") else "image",
-                "image_size": {
-                    "width": original_img.shape[1],
-                    "height": original_img.shape[0],
+                    "processing_timestamp": str(datetime.datetime.now()),
                 },
-                "processing_timestamp": str(datetime.datetime.now()),
-            },
-            "table": {
-                "bounds": table_bounds,
-                "dimensions": {"rows": num_rows, "columns": num_cols},
-                "grid": grid,
-                "cells": result["cells"],
-            },
-            "visualization": {
-                "output_file": f"detected_table_{os.path.splitext(os.path.basename(file_path))[0]}.png"
-            },
-        }
+                "table": {
+                    "bounds": table_bounds,
+                    "dimensions": {"rows": num_rows, "columns": num_cols},
+                    "grid": grid,
+                    "cells": result["cells"],
+                },
+                "visualization": {
+                    "output_file": f"detected_table_{os.path.splitext(os.path.basename(file_path))[0]}.png"
+                },
+            }
 
-        # Step 7: Create a visualization image (using original image for better visualization)
-        vis_img = original_img.copy()
+            # Step 6: Create visualization
+            self._create_visualization(original_img, table_bounds, result["cells"], 
+                                      response["visualization"]["output_file"], num_rows, num_cols)
+
+            if hasattr(self.logger, 'flush'):
+                self.logger.flush()
+                
+            return response
+
+        except Exception as e:
+            self.logger.error(f"Error during processing: {str(e)}")
+            raise
+        finally:
+            # Clean up temporary files
+            if 'processed_path' in locals() and os.path.exists(processed_path):
+                try:
+                    os.remove(processed_path)
+                except OSError:
+                    pass
+
+    def _create_visualization(self, img, table_bounds, cells, output_file, num_rows, num_cols):
+        """Create and save visualization of detected table and cells."""
+        vis_img = img.copy()
 
         # Draw table boundary in red
         cv2.rectangle(
@@ -183,11 +188,11 @@ def process_schedule_file(file_path):
         )
 
         # Generate random colors for cells
-        np.random.seed(42)  # For reproducible colors
-        colors = np.random.randint(0, 255, size=(len(result["cells"]), 3)).tolist()
+        np.random.seed(42)
+        colors = np.random.randint(0, 255, size=(len(cells), 3)).tolist()
 
         # Draw cells with random colors
-        for cell, color in zip(result["cells"], colors):
+        for cell, color in zip(cells, colors):
             cv2.rectangle(
                 vis_img,
                 (cell["bounds"]["x1"], cell["bounds"]["y1"]),
@@ -197,8 +202,8 @@ def process_schedule_file(file_path):
             )
 
         # Save visualization
-        cv2.imwrite(response["visualization"]["output_file"], vis_img)
-        logger.info(f"Saved visualization to {response['visualization']['output_file']}")
+        cv2.imwrite(output_file, vis_img)
+        self.logger.info(f"Saved visualization to {output_file}")
 
         # Display processed image
         plt.figure(figsize=(15, 12))
@@ -207,87 +212,35 @@ def process_schedule_file(file_path):
         plt.title(f"Detected Table and Cells ({num_rows}x{num_cols} grid)")
         plt.show()
 
-        if hasattr(logger, 'flush'):
-            logger.flush()
-        return response
 
-    except Exception as e:
-        logger.error(f"Error during processing: {str(e)}")
-        raise
-    finally:
-        # Clean up temporary files
-        if 'processed_path' in locals() and os.path.exists(processed_path):
-            try:
-                os.remove(processed_path)
-            except OSError:
-                pass
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description='Table OCR Processor')
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode')
+    parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+                       default='INFO', help='Logging level')
+    parser.add_argument('--file', type=str, default='i_a.pdf', help='Input file path')
+    return parser.parse_args()
 
-def debug_visualize_detection(img, table_bounds, cells):
-    """Create a debug visualization to see what's being detected."""
-    debug_img = img.copy()
-    
-    # Draw table bounds in red
-    cv2.rectangle(
-        debug_img,
-        (table_bounds["x1"], table_bounds["y1"]),
-        (table_bounds["x2"], table_bounds["y2"]),
-        (0, 0, 255),
-        3
-    )
-    
-    # Draw each cell in a different color
-    for i, cell in enumerate(cells):
-        color = (
-            (i * 37) % 255,
-            (i * 67) % 255,
-            (i * 97) % 255
-        )
-        cv2.rectangle(
-            debug_img,
-            (cell["x1"], cell["y1"]),
-            (cell["x2"], cell["y2"]),
-            color,
-            2
-        )
-        # Add cell number
-        cv2.putText(
-            debug_img,
-            str(i),
-            (cell["x1"] + 5, cell["y1"] + 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            color,
-            1
-        )
-    
-    cv2.imwrite("debug_detection.png", debug_img)
-    logger.info(f"Saved debug visualization with {len(cells)} cells")
 
-# Example usage
 if __name__ == "__main__":
     args = parse_args()
     log_level = getattr(logging, args.log_level)
-    setup_logging(log_level=log_level, log_to_file=args.debug)
-    if args.debug:
-            # Enable debug mode in table_detector
-            import src.table_detector as td
-            td.DEBUG_MODE = True
-            
-    file_path = "i_a.pdf"  
+    
+    # Create processor
+    processor = TableOCRProcessor(debug=args.debug, log_level=log_level)
+    
     try:
-        result = process_schedule_file(file_path)
+        result = processor.process_file(args.file)
+        
         if not result["table"]["grid"]:
             print("No cells were detected.")
             exit(1)
 
         print("\nExtracted Table Data:")
         print(f"File: {result['metadata']['file_name']}")
-        print(
-            f"Image size: {result['metadata']['image_size']['width']}x{result['metadata']['image_size']['height']}"
-        )
-        print(
-            f"Table dimensions: {result['table']['dimensions']['rows']}x{result['table']['dimensions']['columns']}"
-        )
+        print(f"Image size: {result['metadata']['image_size']['width']}x{result['metadata']['image_size']['height']}")
+        print(f"Table dimensions: {result['table']['dimensions']['rows']}x{result['table']['dimensions']['columns']}")
         print("\nTable structure:")
         for row in result["table"]["grid"]:
             print(row)
