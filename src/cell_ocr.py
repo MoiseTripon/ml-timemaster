@@ -7,7 +7,7 @@ import logging
 import cv2
 import numpy as np
 import pytesseract
-from src.performance_logger import PerformanceLogger, LogContext, timed_operation
+from src.performance_logger import LogContext, timed_operation
 
 
 class CellOCR:
@@ -37,8 +37,7 @@ class CellOCR:
         self.high_confidence_threshold = high_confidence_threshold
         self.verbose_logging = verbose_logging
         
-        _base_logger = logging.getLogger(__name__)
-        self.logger = PerformanceLogger(_base_logger)
+        self.logger = logging.getLogger(__name__)
 
         # OCR configurations to try
         self.configs = [
@@ -181,6 +180,7 @@ class CellOCR:
         """
         cell_id = f"Cell[{cell['x1']},{cell['y1']}-{cell['x2']},{cell['y2']}]"
         
+        # Use context manager to control logging level for verbose operations
         with LogContext(__name__, 
                         temp_level=logging.DEBUG if self.verbose_logging else logging.WARNING):
             
@@ -251,6 +251,3 @@ class CellOCR:
                 self.logger.error(f"{cell_id}: Error during extraction: {str(e)}", 
                                 exc_info=self.verbose_logging)
                 return ""
-            
-        if hasattr(self.logger, 'flush'):
-            self.logger.flush()

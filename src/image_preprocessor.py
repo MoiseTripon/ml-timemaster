@@ -108,7 +108,7 @@ class ImagePreprocessor:
             )
             denoised = cv2.fastNlMeansDenoising(binary)
             _, binarized = cv2.threshold(
-                denoised,  0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+                denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
             )
 
             # Save preprocessed image

@@ -7,76 +7,81 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 
+from src.performance_logger import PerformanceHandler, timed_operation
 from src.image_preprocessor import ImagePreprocessor
 from src.table_detector import TableDetector
 from src.cell_ocr import CellOCR
 from src.grid_builder import GridBuilder
-from src.performance_logger import PerformanceLogger
+
+
+def setup_logging(debug=False, log_level=logging.INFO):
+    """
+    Configure logging for the entire application - called once at startup.
+    
+    Args:
+        debug (bool): Enable debug mode with file logging
+        log_level (int): Logging level
+        
+    Returns:
+        logging.Logger: Configured root logger
+    """
+    # Create logs directory if needed
+    if debug and not os.path.exists("logs"):
+        os.makedirs("logs")
+    
+    # Get root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level)
+    
+    # Clear any existing handlers
+    root_logger.handlers = []
+    
+    # Create formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
+    )
+    
+    # Console handler with performance optimization
+    console_handler = PerformanceHandler(
+        base_handler=logging.StreamHandler(sys.stdout),
+        batch_size=100 if not debug else 1,  # No batching in debug mode
+        batch_timeout=1.0
+    )
+    console_handler.setLevel(log_level)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+    
+    # File handler for debug mode
+    if debug:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_handler = logging.FileHandler(f"logs/table_detector_{timestamp}.log")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+    
+    return root_logger
 
 
 class TableOCRProcessor:
     """Main class for processing table OCR from PDF or image files."""
     
-    def __init__(self, debug=False, log_level=logging.INFO):
+    def __init__(self, debug=False):
         """
         Initialize the Table OCR Processor.
         
         Args:
             debug (bool): Enable debug mode
-            log_level (int): Logging level
         """
         self.debug = debug
-        self.log_level = log_level
-        self.logger = self._setup_logging()
+        self.logger = logging.getLogger(__name__)
         
         # Initialize components
         self.preprocessor = ImagePreprocessor()
         self.table_detector = TableDetector(debug_mode=debug)
         self.ocr_processor = CellOCR(verbose_logging=debug)
         self.grid_builder = GridBuilder()
-        
-    def _setup_logging(self):
-        """Configure logging for the application."""
-        # Create logs directory if it doesn't exist
-        if self.debug and not os.path.exists("logs"):
-            os.makedirs("logs")
-        
-        # Create a timestamp for the log file
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # Configure the root logger
-        root_logger = logging.getLogger()
-        root_logger.setLevel(self.log_level)
-        
-        # Clear any existing handlers
-        root_logger.handlers = []
-        
-        # Create formatter
-        formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
-        )
-        
-        # Console handler
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(self.log_level)
-        console_handler.setFormatter(formatter)
-        root_logger.addHandler(console_handler)
-        
-        # File handler
-        if self.debug:
-            file_handler = logging.FileHandler(f"logs/table_detector_{timestamp}.log")
-            file_handler.setLevel(self.log_level)
-            file_handler.setFormatter(formatter)
-            root_logger.addHandler(file_handler)
-        
-        logger = logging.getLogger(__name__)
-        
-        # Wrap with performance logger if not in debug mode
-        if not self.debug:
-            logger = PerformanceLogger(logger)
-            
-        return logger
 
+    @timed_operation("File processing")
     def process_file(self, file_path):
         """
         Process a schedule file (PDF or image) and extract table data.
@@ -157,9 +162,6 @@ class TableOCRProcessor:
             # Step 6: Create visualization
             self._create_visualization(original_img, table_bounds, result["cells"], 
                                       response["visualization"]["output_file"], num_rows, num_cols)
-
-            if hasattr(self.logger, 'flush'):
-                self.logger.flush()
                 
             return response
 
@@ -227,8 +229,11 @@ if __name__ == "__main__":
     args = parse_args()
     log_level = getattr(logging, args.log_level)
     
+    # Setup logging once for the entire application
+    setup_logging(debug=args.debug, log_level=log_level)
+    
     # Create processor
-    processor = TableOCRProcessor(debug=args.debug, log_level=log_level)
+    processor = TableOCRProcessor(debug=args.debug)
     
     try:
         result = processor.process_file(args.file)
