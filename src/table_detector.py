@@ -57,37 +57,67 @@ class TableDetector:
         
         self.save_debug_image(gray, "grayscale", "01")
         
-        # Scale kernel size based on image dimensions
+        # Scale kernel size based on image dimensions (smaller kernel for border detection)
         img_h, img_w = gray.shape[:2]
-        morph_kernel_size = max(3, min(img_w, img_h) // 100)
+        morph_kernel_size = max(3, min(img_w, img_h) // 200)  # Smaller kernel
         morph_kernel = cv2.getStructuringElement(
             cv2.MORPH_RECT, 
             (morph_kernel_size, morph_kernel_size)
         )
         
-        # Apply morphology BEFORE Canny to clean up the image
-        # Use closing to fill small gaps in borders
-        morphed = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, morph_kernel, iterations=1)
-        # Use opening to remove small noise
-        morphed = cv2.morphologyEx(morphed, cv2.MORPH_OPEN, morph_kernel, iterations=1)
+        # Apply light morphology BEFORE Canny to clean up the image
+        # Use gradient to enhance borders
+        morphed = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, morph_kernel)
         
-        self.save_debug_image(morphed, "morphed", "02")
+        self.save_debug_image(morphed, "morphed_gradient", "02")
         
-        # Detect edges after morphology
-        edges = cv2.Canny(morphed, 50, 150, apertureSize=3)
-        self.save_debug_image(edges, "edges", "03")
+        # Apply Gaussian blur to reduce noise before edge detection
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        
+        # Try multiple edge detection approaches and combine results
+        edges1 = cv2.Canny(blurred, 50, 150, apertureSize=3)
+        edges2 = cv2.Canny(morphed, 30, 100, apertureSize=3)
+        
+        # Combine edges from both methods
+        edges = cv2.bitwise_or(edges1, edges2)
+        
+        # Apply dilation to connect nearby edges
+        dilation_kernel = np.ones((3, 3), np.uint8)
+        edges = cv2.dilate(edges, dilation_kernel, iterations=1)
+        edges = cv2.erode(edges, dilation_kernel, iterations=1)
+        
+        self.save_debug_image(edges, "edges_combined", "03")
         
         # Find contours
         contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         self.logger.info(f"Found {len(contours)} contours")
         
         if not contours:
-            self.logger.error("No contours found in the image")
-            raise ValueError("No table detected in the image")
+            # Fallback: try to detect without morphology
+            self.logger.warning("No contours found with morphology, trying without")
+            edges_fallback = cv2.Canny(gray, 50, 150, apertureSize=3)
+            contours, _ = cv2.findContours(edges_fallback, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if not contours:
+                self.logger.error("No contours found in the image")
+                raise ValueError("No table detected in the image")
         
-        # Find the largest contour
+        # Find the largest contour (assume it's the table)
         main_contour = max(contours, key=cv2.contourArea)
         x, y, w, h = cv2.boundingRect(main_contour)
+        
+        # Validate the detected bounds
+        min_area_ratio = 0.1  # Table should be at least 10% of image
+        if (w * h) < (img_w * img_h * min_area_ratio):
+            self.logger.warning("Detected table seems too small, looking for larger contour")
+            # Sort contours by area and try to find a better one
+            sorted_contours = sorted(contours, key=cv2.contourArea, reverse=True)
+            for contour in sorted_contours:
+                x_tmp, y_tmp, w_tmp, h_tmp = cv2.boundingRect(contour)
+                if (w_tmp * h_tmp) >= (img_w * img_h * min_area_ratio):
+                    x, y, w, h = x_tmp, y_tmp, w_tmp, h_tmp
+                    break
+        
         table_bounds = {"x1": x, "y1": y, "x2": x + w, "y2": y + h}
         
         self.logger.info(f"Detected table boundaries: {table_bounds}")
@@ -172,77 +202,86 @@ class TableDetector:
         Returns:
             list: List of detected cell dictionaries
         """
-        # Scale kernel sizes with table dimensions (5% of dimension, min 20px)
-        horizontal_kernel_width = max(int(w * 0.05), 20)
-        vertical_kernel_height = max(int(h * 0.05), 20)
+        # Scale kernel sizes with table dimensions (5% of dimension, min 20px, max 100px)
+        horizontal_kernel_width = min(max(int(w * 0.05), 20), 100)
+        vertical_kernel_height = min(max(int(h * 0.05), 20), 100)
         
         self.logger.debug(f"Using horizontal kernel width: {horizontal_kernel_width}")
         self.logger.debug(f"Using vertical kernel height: {vertical_kernel_height}")
         
-        # Scale morphology cleanup kernel
-        cleanup_kernel_size = max(2, min(w, h) // 200)
-        cleanup_kernel = cv2.getStructuringElement(
-            cv2.MORPH_RECT, 
-            (cleanup_kernel_size, cleanup_kernel_size)
-        )
+        # Try different preprocessing methods
+        cells_detected = []
         
-        # Apply morphology to clean up the image before line detection
-        cleaned = cv2.morphologyEx(binary_img, cv2.MORPH_CLOSE, cleanup_kernel)
-        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cleanup_kernel)
+        # Method 1: Direct threshold
+        _, thresh1 = cv2.threshold(binary_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         
-        # Invert image (lines should be white on black background for morphology)
-        _, thresh = cv2.threshold(cleaned, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        # Method 2: Adaptive threshold
+        thresh2 = cv2.adaptiveThreshold(binary_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY, 11, 2)
         
-        self.save_debug_image(thresh, "threshold_inverted", "06")
+        for idx, thresh in enumerate([thresh1, thresh2]):
+            # Invert if needed (we want lines to be white)
+            if np.mean(thresh) > 127:  # If mostly white, invert
+                thresh_inv = cv2.bitwise_not(thresh)
+            else:
+                thresh_inv = thresh
+            
+            self.save_debug_image(thresh_inv, f"threshold_method_{idx}", f"06_{idx}")
+            
+            # Create kernels scaled to table size
+            horizontal_kernel = cv2.getStructuringElement(
+                cv2.MORPH_RECT, 
+                (horizontal_kernel_width, 1)
+            )
+            vertical_kernel = cv2.getStructuringElement(
+                cv2.MORPH_RECT, 
+                (1, vertical_kernel_height)
+            )
+            
+            # Detect horizontal lines using morphology
+            horizontal_lines = cv2.morphologyEx(thresh_inv, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
+            horizontal_lines = cv2.morphologyEx(horizontal_lines, cv2.MORPH_CLOSE, horizontal_kernel, iterations=1)
+            self.save_debug_image(horizontal_lines, f"horizontal_lines_{idx}", f"06a_{idx}")
+            
+            # Detect vertical lines using morphology
+            vertical_lines = cv2.morphologyEx(thresh_inv, cv2.MORPH_OPEN, vertical_kernel, iterations=1)
+            vertical_lines = cv2.morphologyEx(vertical_lines, cv2.MORPH_CLOSE, vertical_kernel, iterations=1)
+            self.save_debug_image(vertical_lines, f"vertical_lines_{idx}", f"06b_{idx}")
+            
+            # Find line positions using projection profiles
+            h_positions = self._find_line_positions(horizontal_lines, axis='horizontal', dimension=w)
+            v_positions = self._find_line_positions(vertical_lines, axis='vertical', dimension=h)
+            
+            self.logger.info(f"Method {idx}: Found {len(h_positions)} horizontal and {len(v_positions)} vertical lines")
+            
+            # Only proceed if we found reasonable number of lines
+            if len(h_positions) >= 2 and len(v_positions) >= 2:
+                # Ensure table boundaries are included
+                h_positions = self._ensure_boundary_lines(h_positions, h)
+                v_positions = self._ensure_boundary_lines(v_positions, w)
+                
+                # Save debug visualization of detected lines
+                if self.debug_mode:
+                    debug_lines = cv2.cvtColor(binary_img, cv2.COLOR_GRAY2BGR)
+                    for y_pos in h_positions:
+                        cv2.line(debug_lines, (0, y_pos), (w, y_pos), (0, 255, 0), 2)
+                    for x_pos in v_positions:
+                        cv2.line(debug_lines, (x_pos, 0), (x_pos, h), (255, 0, 0), 2)
+                    # Draw intersection points
+                    for y_pos in h_positions:
+                        for x_pos in v_positions:
+                            cv2.circle(debug_lines, (x_pos, y_pos), 4, (0, 0, 255), -1)
+                    self.save_debug_image(debug_lines, f"line_intersections_{idx}", f"07_{idx}")
+                
+                # Create cells from line intersections
+                cells = self._create_cells_from_intersections(
+                    h_positions, v_positions, table_bounds, w, h
+                )
+                
+                if len(cells) > len(cells_detected):
+                    cells_detected = cells
         
-        # Create kernels scaled to table size
-        horizontal_kernel = cv2.getStructuringElement(
-            cv2.MORPH_RECT, 
-            (horizontal_kernel_width, 1)
-        )
-        vertical_kernel = cv2.getStructuringElement(
-            cv2.MORPH_RECT, 
-            (1, vertical_kernel_height)
-        )
-        
-        # Detect horizontal lines using morphology
-        horizontal_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
-        self.save_debug_image(horizontal_lines, "horizontal_lines", "06a")
-        
-        # Detect vertical lines using morphology
-        vertical_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
-        self.save_debug_image(vertical_lines, "vertical_lines", "06b")
-        
-        # Find line positions using projection profiles
-        h_positions = self._find_line_positions(horizontal_lines, axis='horizontal', dimension=w)
-        v_positions = self._find_line_positions(vertical_lines, axis='vertical', dimension=h)
-        
-        self.logger.info(f"Found {len(h_positions)} horizontal lines at positions: {h_positions}")
-        self.logger.info(f"Found {len(v_positions)} vertical lines at positions: {v_positions}")
-        
-        # Ensure table boundaries are included
-        h_positions = self._ensure_boundary_lines(h_positions, h)
-        v_positions = self._ensure_boundary_lines(v_positions, w)
-        
-        # Save debug visualization of detected lines
-        if self.debug_mode:
-            debug_lines = cv2.cvtColor(binary_img, cv2.COLOR_GRAY2BGR)
-            for y_pos in h_positions:
-                cv2.line(debug_lines, (0, y_pos), (w, y_pos), (0, 255, 0), 2)
-            for x_pos in v_positions:
-                cv2.line(debug_lines, (x_pos, 0), (x_pos, h), (255, 0, 0), 2)
-            # Draw intersection points
-            for y_pos in h_positions:
-                for x_pos in v_positions:
-                    cv2.circle(debug_lines, (x_pos, y_pos), 4, (0, 0, 255), -1)
-            self.save_debug_image(debug_lines, "line_intersections", "07")
-        
-        # Create cells from line intersections
-        cells = self._create_cells_from_intersections(
-            h_positions, v_positions, table_bounds, w, h
-        )
-        
-        return cells
+        return cells_detected
 
     def _find_line_positions(self, line_img, axis='horizontal', dimension=None):
         """
@@ -272,8 +311,8 @@ class TableDetector:
         # Normalize projection
         projection = projection / np.max(projection)
         
-        # Threshold: lines should have at least 10% of max projection
-        threshold = 0.1
+        # Dynamic threshold based on mean projection value
+        threshold = max(0.1, np.mean(projection[projection > 0]) * 0.5) if np.any(projection > 0) else 0.1
         
         # Find indices above threshold
         line_indices = np.where(projection > threshold)[0]
@@ -339,7 +378,7 @@ class TableDetector:
         
         # Add end boundary if not present
         if len(positions) == 0 or positions[-1] < max_dimension - margin:
-            positions.append(max_dimension)
+            positions.append(max_dimension - 1)
         
         return sorted(positions)
 
@@ -401,14 +440,14 @@ class TableDetector:
             (morph_kernel_size, morph_kernel_size)
         )
         
-        # Apply morphology before edge detection
-        morphed = cv2.morphologyEx(binary_img, cv2.MORPH_CLOSE, morph_kernel)
-        morphed = cv2.morphologyEx(morphed, cv2.MORPH_OPEN, morph_kernel)
+        # Apply light morphology before edge detection
+        morphed = cv2.morphologyEx(binary_img, cv2.MORPH_GRADIENT, morph_kernel)
         
         preprocessing_methods = [
+            ("original", binary_img),
             ("morphed", morphed),
-            ("inverted", cv2.bitwise_not(morphed)),
-            ("edges_50_150", cv2.Canny(morphed, 50, 150)),
+            ("inverted", cv2.bitwise_not(binary_img)),
+            ("edges_50_150", cv2.Canny(binary_img, 50, 150)),
             ("edges_30_200", cv2.Canny(morphed, 30, 200)),
         ]
         
