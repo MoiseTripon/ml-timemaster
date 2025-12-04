@@ -57,9 +57,22 @@ class TableDetector:
         
         self.save_debug_image(binary, "grayscale", "01")
         
-        # Detect edges
-        edges = cv2.Canny(binary, 50, 150, apertureSize=3)
-        self.save_debug_image(edges, "edges", "02")
+        # Apply morphological operations BEFORE edge detection
+        # This helps clean up the image and enhance edges
+        kernel_size = max(3, min(binary.shape) // 100)  # Scale with image size
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+        
+        # Close operation to fill small gaps
+        morphed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        self.save_debug_image(morphed, "morphology_close", "02a")
+        
+        # Gradient to enhance edges
+        gradient = cv2.morphologyEx(morphed, cv2.MORPH_GRADIENT, kernel)
+        self.save_debug_image(gradient, "morphology_gradient", "02b")
+        
+        # Now apply Canny on the preprocessed image
+        edges = cv2.Canny(gradient, 50, 150, apertureSize=3)
+        self.save_debug_image(edges, "edges", "02c")
         
         # Find contours
         contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -86,7 +99,7 @@ class TableDetector:
 
     def detect_cells(self, img, table_bounds):
         """
-        Detect individual cells within the table.
+        Detect individual cells within the table using line intersection method.
         
         Args:
             img (numpy.ndarray): Input image
@@ -96,7 +109,7 @@ class TableDetector:
             list: List of cell dictionaries with bounds and dimensions
         """
         self.logger.info("="*50)
-        self.logger.info("Starting cell detection")
+        self.logger.info("Starting cell detection using line intersection")
         
         # Extract table region
         x, y = table_bounds["x1"], table_bounds["y1"]
@@ -112,20 +125,9 @@ class TableDetector:
         else:
             binary_img = table_region.copy()
         
-        # Detect cells using multiple methods
-        all_cells = []
-        
-        cells_method1 = self._detect_cells_by_lines(binary_img, table_bounds, w, h)
-        self.logger.info(f"Line method found {len(cells_method1)} cells")
-        all_cells.extend(cells_method1)
-        
-        cells_method2 = self._detect_cells_by_contours(binary_img, table_bounds, w, h)
-        self.logger.info(f"Contour method found {len(cells_method2)} cells")
-        all_cells.extend(cells_method2)
-        
-        # Remove duplicates
-        cells = self._remove_duplicate_cells(all_cells)
-        self.logger.info(f"Total cells after deduplication: {len(cells)}")
+        # Detect cells using line intersection method
+        cells = self._detect_cells_by_line_intersection(binary_img, table_bounds, w, h)
+        self.logger.info(f"Line intersection method found {len(cells)} cells")
         
         # Save debug visualization
         if self.debug_mode:
@@ -142,75 +144,123 @@ class TableDetector:
         
         return cells
 
-    def _detect_cells_by_lines(self, binary_img, table_bounds, w, h):
-        """Detect cells using horizontal and vertical line detection."""
-        # Detect horizontal and vertical lines
-        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
+    def _detect_cells_by_line_intersection(self, binary_img, table_bounds, w, h):
+        """
+        Detect cells using horizontal and vertical line detection with intersection.
+        Lines are found, then intersected to form rectangular cells.
+        """
+        # Calculate adaptive kernel sizes based on table dimensions
+        # Kernels should be proportional to table size
+        horizontal_kernel_width = max(40, w // 10)  # Scale with table width
+        vertical_kernel_height = max(40, h // 10)   # Scale with table height
+        
+        self.logger.info(f"Using adaptive kernel sizes - Horizontal: {horizontal_kernel_width}, Vertical: {vertical_kernel_height}")
+        
+        # Detect horizontal lines
+        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (horizontal_kernel_width, 1))
         horizontal_lines = cv2.morphologyEx(binary_img, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
+        self.save_debug_image(horizontal_lines, "horizontal_lines", "05a")
         
-        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
+        # Detect vertical lines
+        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vertical_kernel_height))
         vertical_lines = cv2.morphologyEx(binary_img, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
+        self.save_debug_image(vertical_lines, "vertical_lines", "05b")
         
-        # Combine lines
-        table_structure = cv2.addWeighted(horizontal_lines, 0.5, vertical_lines, 0.5, 0)
-        _, table_structure = cv2.threshold(table_structure, 0, 255, cv2.THRESH_BINARY)
+        # Extract line positions
+        horizontal_positions = self._extract_line_positions(horizontal_lines, axis='horizontal')
+        vertical_positions = self._extract_line_positions(vertical_lines, axis='vertical')
         
-        # Find contours
-        contours, _ = cv2.findContours(table_structure, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        self.logger.info(f"Found {len(horizontal_positions)} horizontal lines and {len(vertical_positions)} vertical lines")
         
+        # Add table boundaries if not detected
+        if 0 not in horizontal_positions:
+            horizontal_positions.insert(0, 0)
+        if h not in horizontal_positions:
+            horizontal_positions.append(h)
+        if 0 not in vertical_positions:
+            vertical_positions.insert(0, 0)
+        if w not in vertical_positions:
+            vertical_positions.append(w)
+        
+        # Sort positions
+        horizontal_positions = sorted(set(horizontal_positions))
+        vertical_positions = sorted(set(vertical_positions))
+        
+        # Create cells from line intersections
         cells = []
-        min_area = 100
-        max_area = (w * h) * 0.5
-        
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            x1, y1, width, height = cv2.boundingRect(contour)
-            
-            if min_area <= area <= max_area and width >= 10 and height >= 10:
-                cell = {
-                    "x1": x1 + table_bounds["x1"],
-                    "y1": y1 + table_bounds["y1"],
-                    "x2": x1 + width + table_bounds["x1"],
-                    "y2": y1 + height + table_bounds["y1"],
-                    "width": width,
-                    "height": height,
-                }
-                cells.append(cell)
-        
-        return cells
-
-    def _detect_cells_by_contours(self, binary_img, table_bounds, w, h):
-        """Detect cells using contour detection with multiple preprocessing."""
-        cells = []
-        
-        preprocessing_methods = [
-            ("original", binary_img),
-            ("inverted", cv2.bitwise_not(binary_img)),
-            ("edges_50_150", cv2.Canny(binary_img, 50, 150)),
-            ("edges_30_200", cv2.Canny(binary_img, 30, 200)),
-        ]
-        
-        min_area = (w * h) * 0.0001
-        max_area = (w * h) * 0.99
-        
-        for method_name, processed in preprocessing_methods:
-            contours, _ = cv2.findContours(processed, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-            
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                if min_area <= area <= max_area:
-                    x1, y1, width, height = cv2.boundingRect(contour)
+        for i in range(len(horizontal_positions) - 1):
+            for j in range(len(vertical_positions) - 1):
+                y1 = horizontal_positions[i]
+                y2 = horizontal_positions[i + 1]
+                x1 = vertical_positions[j]
+                x2 = vertical_positions[j + 1]
+                
+                # Filter out very small cells (likely noise)
+                min_cell_width = max(10, w // 50)   # Adaptive minimum size
+                min_cell_height = max(10, h // 50)  # Adaptive minimum size
+                
+                if (x2 - x1) >= min_cell_width and (y2 - y1) >= min_cell_height:
                     cell = {
                         "x1": x1 + table_bounds["x1"],
                         "y1": y1 + table_bounds["y1"],
-                        "x2": x1 + width + table_bounds["x1"],
-                        "y2": y1 + height + table_bounds["y1"],
-                        "width": width,
-                        "height": height,
+                        "x2": x2 + table_bounds["x1"],
+                        "y2": y2 + table_bounds["y1"],
+                        "width": x2 - x1,
+                        "height": y2 - y1,
                     }
                     cells.append(cell)
         
         return cells
+
+    def _extract_line_positions(self, line_image, axis='horizontal', min_gap=5):
+        """
+        Extract positions of lines from a binary image.
+        
+        Args:
+            line_image: Binary image with detected lines
+            axis: 'horizontal' or 'vertical'
+            min_gap: Minimum gap between consecutive lines to consider them separate
+            
+        Returns:
+            list: Sorted list of line positions
+        """
+        positions = []
+        
+        if axis == 'horizontal':
+            # Sum pixels across columns for horizontal lines
+            projection = np.sum(line_image, axis=1)
+        else:
+            # Sum pixels across rows for vertical lines
+            projection = np.sum(line_image, axis=0)
+        
+        # Find peaks in projection (line positions)
+        threshold = np.max(projection) * 0.1  # Consider positions with at least 10% of max intensity
+        line_detected = projection > threshold
+        
+        # Find continuous regions
+        in_line = False
+        start_pos = 0
+        
+        for i, is_line in enumerate(line_detected):
+            if is_line and not in_line:
+                in_line = True
+                start_pos = i
+            elif not is_line and in_line:
+                in_line = False
+                # Use the middle of the line region
+                middle_pos = (start_pos + i - 1) // 2
+                
+                # Check if this line is far enough from the previous one
+                if not positions or abs(middle_pos - positions[-1]) >= min_gap:
+                    positions.append(middle_pos)
+        
+        # Handle case where line extends to the edge
+        if in_line:
+            middle_pos = (start_pos + len(line_detected) - 1) // 2
+            if not positions or abs(middle_pos - positions[-1]) >= min_gap:
+                positions.append(middle_pos)
+        
+        return sorted(positions)
 
     def _remove_duplicate_cells(self, cells, tolerance=10):
         """Remove duplicate cells that overlap significantly."""
