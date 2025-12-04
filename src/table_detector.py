@@ -132,7 +132,7 @@ class TableDetector:
 
     def detect_cells(self, img, table_bounds):
         """
-        Detect individual cells within the table.
+        Detect individual cells within the table, including merged cells (colspan/rowspan).
         
         Args:
             img (numpy.ndarray): Input image
@@ -158,15 +158,14 @@ class TableDetector:
         else:
             binary_img = table_region.copy()
         
-        # Detect cells using line-intersection method (primary)
-        cells = self._detect_cells_by_line_intersection(binary_img, table_bounds, w, h)
-        self.logger.info(f"Line intersection method found {len(cells)} cells")
+        # Detect cells using actual contours (handles merged cells)
+        cells = self._detect_cells_with_merged(binary_img, table_bounds, w, h)
+        self.logger.info(f"Cell detection found {len(cells)} cells (including merged)")
         
-        # If line intersection didn't find enough cells, try contour method as fallback
-        if len(cells) < 2:
+        # If no cells found, try fallback methods
+        if len(cells) < 1:
             self.logger.info("Falling back to contour-based detection")
-            cells_fallback = self._detect_cells_by_contours(binary_img, table_bounds, w, h)
-            cells.extend(cells_fallback)
+            cells = self._detect_cells_by_contours(binary_img, table_bounds, w, h)
             cells = self._remove_duplicate_cells(cells)
         
         self.logger.info(f"Total cells detected: {len(cells)}")
@@ -182,16 +181,17 @@ class TableDetector:
                 
                 color = ((i * 37) % 255, (i * 67) % 255, (i * 97) % 255)
                 cv2.rectangle(debug_img, (x1, y1), (x2, y2), color, 2)
+                # Add cell index for debugging
+                cv2.putText(debug_img, str(i), (x1+5, y1+20), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             self.save_debug_image(debug_img, "detected_cells", "08")
         
         return cells
 
-    def _detect_cells_by_line_intersection(self, binary_img, table_bounds, w, h):
+    def _detect_cells_with_merged(self, binary_img, table_bounds, w, h):
         """
-        Detect cells using horizontal and vertical line detection with line-intersection.
-        
-        This method finds horizontal and vertical lines separately, determines their
-        positions, and creates cells from the intersections of consecutive lines.
+        Detect cells including merged cells (colspan/rowspan) by finding actual cell contours
+        rather than assuming a regular grid.
         
         Args:
             binary_img: Grayscale image of the table region
@@ -202,235 +202,299 @@ class TableDetector:
         Returns:
             list: List of detected cell dictionaries
         """
-        # Scale kernel sizes with table dimensions (5% of dimension, min 20px, max 100px)
+        # First detect actual lines that exist in the image
+        h_lines, v_lines = self._detect_actual_lines(binary_img, w, h)
+        
+        self.logger.info(f"Detected {len(h_lines)} horizontal line segments and {len(v_lines)} vertical line segments")
+        
+        # Build a line image from detected segments
+        line_img = np.zeros_like(binary_img)
+        
+        # Draw horizontal lines
+        for line in h_lines:
+            cv2.line(line_img, (line['x1'], line['y']), (line['x2'], line['y']), 255, 1)
+        
+        # Draw vertical lines
+        for line in v_lines:
+            cv2.line(line_img, (line['x'], line['y1']), (line['x'], line['y2']), 255, 1)
+        
+        self.save_debug_image(line_img, "detected_line_segments", "06c")
+        
+        # Find cell contours from the line image
+        cells = self._find_cells_from_lines(line_img, binary_img, table_bounds, w, h)
+        
+        return cells
+
+    def _detect_actual_lines(self, binary_img, w, h):
+        """
+        Detect actual line segments that exist in the image, not assuming a complete grid.
+        This allows for detection of merged cells.
+        
+        Returns:
+            tuple: (horizontal_lines, vertical_lines) where each is a list of line segments
+        """
+        # Scale kernel sizes with table dimensions
         horizontal_kernel_width = min(max(int(w * 0.05), 20), 100)
         vertical_kernel_height = min(max(int(h * 0.05), 20), 100)
         
-        self.logger.debug(f"Using horizontal kernel width: {horizontal_kernel_width}")
-        self.logger.debug(f"Using vertical kernel height: {vertical_kernel_height}")
+        # Threshold the image
+        _, thresh = cv2.threshold(binary_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         
-        # Try different preprocessing methods
-        cells_detected = []
+        # Invert if needed (lines should be white)
+        if np.mean(thresh) > 127:
+            thresh = cv2.bitwise_not(thresh)
         
-        # Method 1: Direct threshold
-        _, thresh1 = cv2.threshold(binary_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Create kernels for line detection
+        horizontal_kernel = cv2.getStructuringElement(
+            cv2.MORPH_RECT, 
+            (horizontal_kernel_width, 1)
+        )
+        vertical_kernel = cv2.getStructuringElement(
+            cv2.MORPH_RECT, 
+            (1, vertical_kernel_height)
+        )
         
-        # Method 2: Adaptive threshold
-        thresh2 = cv2.adaptiveThreshold(binary_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY, 11, 2)
+        # Detect horizontal lines
+        horizontal_lines_img = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
+        self.save_debug_image(horizontal_lines_img, "horizontal_lines_raw", "06a")
         
-        for idx, thresh in enumerate([thresh1, thresh2]):
-            # Invert if needed (we want lines to be white)
-            if np.mean(thresh) > 127:  # If mostly white, invert
-                thresh_inv = cv2.bitwise_not(thresh)
-            else:
-                thresh_inv = thresh
-            
-            self.save_debug_image(thresh_inv, f"threshold_method_{idx}", f"06_{idx}")
-            
-            # Create kernels scaled to table size
-            horizontal_kernel = cv2.getStructuringElement(
-                cv2.MORPH_RECT, 
-                (horizontal_kernel_width, 1)
-            )
-            vertical_kernel = cv2.getStructuringElement(
-                cv2.MORPH_RECT, 
-                (1, vertical_kernel_height)
-            )
-            
-            # Detect horizontal lines using morphology
-            horizontal_lines = cv2.morphologyEx(thresh_inv, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
-            horizontal_lines = cv2.morphologyEx(horizontal_lines, cv2.MORPH_CLOSE, horizontal_kernel, iterations=1)
-            self.save_debug_image(horizontal_lines, f"horizontal_lines_{idx}", f"06a_{idx}")
-            
-            # Detect vertical lines using morphology
-            vertical_lines = cv2.morphologyEx(thresh_inv, cv2.MORPH_OPEN, vertical_kernel, iterations=1)
-            vertical_lines = cv2.morphologyEx(vertical_lines, cv2.MORPH_CLOSE, vertical_kernel, iterations=1)
-            self.save_debug_image(vertical_lines, f"vertical_lines_{idx}", f"06b_{idx}")
-            
-            # Find line positions using projection profiles
-            h_positions = self._find_line_positions(horizontal_lines, axis='horizontal', dimension=w)
-            v_positions = self._find_line_positions(vertical_lines, axis='vertical', dimension=h)
-            
-            self.logger.info(f"Method {idx}: Found {len(h_positions)} horizontal and {len(v_positions)} vertical lines")
-            
-            # Only proceed if we found reasonable number of lines
-            if len(h_positions) >= 2 and len(v_positions) >= 2:
-                # Ensure table boundaries are included
-                h_positions = self._ensure_boundary_lines(h_positions, h)
-                v_positions = self._ensure_boundary_lines(v_positions, w)
-                
-                # Save debug visualization of detected lines
-                if self.debug_mode:
-                    debug_lines = cv2.cvtColor(binary_img, cv2.COLOR_GRAY2BGR)
-                    for y_pos in h_positions:
-                        cv2.line(debug_lines, (0, y_pos), (w, y_pos), (0, 255, 0), 2)
-                    for x_pos in v_positions:
-                        cv2.line(debug_lines, (x_pos, 0), (x_pos, h), (255, 0, 0), 2)
-                    # Draw intersection points
-                    for y_pos in h_positions:
-                        for x_pos in v_positions:
-                            cv2.circle(debug_lines, (x_pos, y_pos), 4, (0, 0, 255), -1)
-                    self.save_debug_image(debug_lines, f"line_intersections_{idx}", f"07_{idx}")
-                
-                # Create cells from line intersections
-                cells = self._create_cells_from_intersections(
-                    h_positions, v_positions, table_bounds, w, h
-                )
-                
-                if len(cells) > len(cells_detected):
-                    cells_detected = cells
+        # Detect vertical lines
+        vertical_lines_img = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vertical_kernel, iterations=1)
+        self.save_debug_image(vertical_lines_img, "vertical_lines_raw", "06b")
         
-        return cells_detected
+        # Extract line segments (not just positions)
+        h_segments = self._extract_line_segments(horizontal_lines_img, 'horizontal', w, h)
+        v_segments = self._extract_line_segments(vertical_lines_img, 'vertical', w, h)
+        
+        return h_segments, v_segments
 
-    def _find_line_positions(self, line_img, axis='horizontal', dimension=None):
+    def _extract_line_segments(self, line_img, orientation, w, h):
         """
-        Find the positions of detected lines using projection profile analysis.
+        Extract line segments from a binary image containing detected lines.
+        This finds actual line segments, not assuming they span the entire width/height.
         
         Args:
             line_img: Binary image with detected lines
-            axis: 'horizontal' or 'vertical'
-            dimension: Size along the perpendicular axis for threshold calculation
+            orientation: 'horizontal' or 'vertical'
+            w, h: Width and height of the image
             
         Returns:
-            list: Sorted list of line positions (y-coordinates for horizontal, 
-                  x-coordinates for vertical)
+            list: List of line segment dictionaries
         """
-        positions = []
+        segments = []
+        min_line_length = 10  # Minimum length for a valid line segment
         
-        if axis == 'horizontal':
-            # Sum along rows to find horizontal lines (project onto y-axis)
-            projection = np.sum(line_img, axis=1).astype(np.float64)
-        else:
-            # Sum along columns to find vertical lines (project onto x-axis)
-            projection = np.sum(line_img, axis=0).astype(np.float64)
+        if orientation == 'horizontal':
+            # Process each row to find horizontal line segments
+            for y in range(h):
+                row = line_img[y, :]
+                if np.sum(row) < 255 * min_line_length:
+                    continue
+                
+                # Find continuous segments in this row
+                diff = np.diff(np.concatenate(([0], row, [0])))
+                starts = np.where(diff > 200)[0]  # Line starts
+                ends = np.where(diff < -200)[0]   # Line ends
+                
+                for start, end in zip(starts, ends):
+                    if end - start >= min_line_length:
+                        segments.append({
+                            'y': y,
+                            'x1': int(start),
+                            'x2': int(end),
+                            'orientation': 'horizontal'
+                        })
         
-        if np.max(projection) == 0:
-            return positions
+        else:  # vertical
+            # Process each column to find vertical line segments
+            for x in range(w):
+                col = line_img[:, x]
+                if np.sum(col) < 255 * min_line_length:
+                    continue
+                
+                # Find continuous segments in this column
+                diff = np.diff(np.concatenate(([0], col, [0])))
+                starts = np.where(diff > 200)[0]  # Line starts
+                ends = np.where(diff < -200)[0]   # Line ends
+                
+                for start, end in zip(starts, ends):
+                    if end - start >= min_line_length:
+                        segments.append({
+                            'x': x,
+                            'y1': int(start),
+                            'y2': int(end),
+                            'orientation': 'vertical'
+                        })
         
-        # Normalize projection
-        projection = projection / np.max(projection)
+        # Merge nearby parallel segments
+        segments = self._merge_nearby_segments(segments, orientation)
         
-        # Dynamic threshold based on mean projection value
-        threshold = max(0.1, np.mean(projection[projection > 0]) * 0.5) if np.any(projection > 0) else 0.1
-        
-        # Find indices above threshold
-        line_indices = np.where(projection > threshold)[0]
-        
-        if len(line_indices) == 0:
-            return positions
-        
-        # Group consecutive indices (lines might be multiple pixels thick)
-        # Use adaptive tolerance based on image dimension
-        tolerance = max(3, (dimension or len(projection)) // 100)
-        
-        groups = self._group_consecutive_indices(line_indices, tolerance)
-        
-        # Take the median of each group as the line position
-        positions = [int(np.median(group)) for group in groups]
-        
-        return sorted(positions)
+        return segments
 
-    def _group_consecutive_indices(self, indices, tolerance):
+    def _merge_nearby_segments(self, segments, orientation, tolerance=3):
         """
-        Group consecutive indices within a tolerance.
+        Merge line segments that are close to each other and likely part of the same line.
         
         Args:
-            indices: Array of indices
-            tolerance: Maximum gap between consecutive indices in same group
+            segments: List of line segments
+            orientation: 'horizontal' or 'vertical'
+            tolerance: Maximum distance between segments to merge
             
         Returns:
-            list: List of grouped indices
+            list: Merged line segments
         """
-        if len(indices) == 0:
-            return []
+        if not segments:
+            return segments
         
-        groups = []
-        current_group = [indices[0]]
+        merged = []
         
-        for idx in indices[1:]:
-            if idx - current_group[-1] <= tolerance:
-                current_group.append(idx)
-            else:
-                groups.append(current_group)
-                current_group = [idx]
-        groups.append(current_group)
+        if orientation == 'horizontal':
+            # Sort by y position
+            segments.sort(key=lambda s: s['y'])
+            
+            current = segments[0].copy()
+            for seg in segments[1:]:
+                if abs(seg['y'] - current['y']) <= tolerance:
+                    # Merge overlapping or close segments
+                    current['x1'] = min(current['x1'], seg['x1'])
+                    current['x2'] = max(current['x2'], seg['x2'])
+                else:
+                    merged.append(current)
+                    current = seg.copy()
+            merged.append(current)
         
-        return groups
+        else:  # vertical
+            # Sort by x position
+            segments.sort(key=lambda s: s['x'])
+            
+            current = segments[0].copy()
+            for seg in segments[1:]:
+                if abs(seg['x'] - current['x']) <= tolerance:
+                    # Merge overlapping or close segments
+                    current['y1'] = min(current['y1'], seg['y1'])
+                    current['y2'] = max(current['y2'], seg['y2'])
+                else:
+                    merged.append(current)
+                    current = seg.copy()
+            merged.append(current)
+        
+        return merged
 
-    def _ensure_boundary_lines(self, positions, max_dimension, margin=5):
+    def _find_cells_from_lines(self, line_img, original_img, table_bounds, w, h):
         """
-        Ensure that boundary lines (at 0 and max_dimension) are included.
+        Find individual cells (including merged cells) from the detected line segments.
         
         Args:
-            positions: List of line positions
-            max_dimension: Maximum coordinate (width or height)
-            margin: Margin from edges to consider as boundary
+            line_img: Binary image with drawn line segments
+            original_img: Original grayscale image
+            table_bounds: Table boundary coordinates
+            w, h: Width and height of table region
             
         Returns:
-            list: Updated positions with boundaries included
+            list: List of detected cells
         """
-        positions = list(positions)  # Make a copy
+        # Invert the line image to have cells as white regions
+        inverted = cv2.bitwise_not(line_img)
         
-        # Add start boundary if not present
-        if len(positions) == 0 or positions[0] > margin:
-            positions.insert(0, 0)
+        # Close small gaps
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        closed = cv2.morphologyEx(inverted, cv2.MORPH_CLOSE, kernel, iterations=1)
         
-        # Add end boundary if not present
-        if len(positions) == 0 or positions[-1] < max_dimension - margin:
-            positions.append(max_dimension - 1)
+        self.save_debug_image(closed, "cells_as_regions", "07")
         
-        return sorted(positions)
-
-    def _create_cells_from_intersections(self, h_positions, v_positions, table_bounds, w, h):
-        """
-        Create cell rectangles from the intersections of horizontal and vertical lines.
+        # Find contours of cells
+        contours, hierarchy = cv2.findContours(closed, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         
-        Args:
-            h_positions: List of y-coordinates for horizontal lines
-            v_positions: List of x-coordinates for vertical lines
-            table_bounds: Dictionary with table boundary coordinates
-            w: Width of table region
-            h: Height of table region
-            
-        Returns:
-            list: List of cell dictionaries
-        """
         cells = []
+        min_cell_area = max(100, (w * h) * 0.001)  # Minimum 0.1% of table area
+        max_cell_area = (w * h) * 0.95  # Maximum 95% of table area
         
-        # Calculate minimum cell dimensions (1% of table size or 10px minimum)
-        min_cell_width = max(10, int(w * 0.01))
-        min_cell_height = max(10, int(h * 0.01))
+        for i, contour in enumerate(contours):
+            area = cv2.contourArea(contour)
+            
+            # Skip too small or too large contours
+            if area < min_cell_area or area > max_cell_area:
+                continue
+            
+            # Get bounding rectangle
+            x1, y1, width, height = cv2.boundingRect(contour)
+            
+            # Skip if too small
+            if width < 10 or height < 10:
+                continue
+            
+            # Check if this contour is inside another (nested contours)
+            if hierarchy[0][i][3] != -1:  # Has parent
+                parent_area = cv2.contourArea(contours[hierarchy[0][i][3]])
+                # Skip if parent is also a valid cell size
+                if min_cell_area <= parent_area <= max_cell_area:
+                    continue
+            
+            cell = {
+                "x1": x1 + table_bounds["x1"],
+                "y1": y1 + table_bounds["y1"],
+                "x2": x1 + width + table_bounds["x1"],
+                "y2": y1 + height + table_bounds["y1"],
+                "width": width,
+                "height": height,
+                "area": area,
+                "is_merged": False  # Will be updated if cell spans multiple grid positions
+            }
+            
+            cells.append(cell)
         
-        # Iterate through consecutive line pairs to form cells
-        for row_idx in range(len(h_positions) - 1):
-            for col_idx in range(len(v_positions) - 1):
-                y1 = h_positions[row_idx]
-                y2 = h_positions[row_idx + 1]
-                x1 = v_positions[col_idx]
-                x2 = v_positions[col_idx + 1]
-                
-                cell_width = x2 - x1
-                cell_height = y2 - y1
-                
-                # Filter cells that are too small
-                if cell_width >= min_cell_width and cell_height >= min_cell_height:
-                    cell = {
-                        "x1": x1 + table_bounds["x1"],
-                        "y1": y1 + table_bounds["y1"],
-                        "x2": x2 + table_bounds["x1"],
-                        "y2": y2 + table_bounds["y1"],
-                        "width": cell_width,
-                        "height": cell_height,
-                        "row": row_idx,
-                        "col": col_idx,
-                    }
-                    cells.append(cell)
+        # Sort cells by position (top-to-bottom, left-to-right)
+        cells.sort(key=lambda c: (c['y1'], c['x1']))
+        
+        # Detect merged cells by checking if they span multiple typical cell sizes
+        cells = self._identify_merged_cells(cells, w, h)
+        
+        return cells
+
+    def _identify_merged_cells(self, cells, table_w, table_h):
+        """
+        Identify which cells are merged (colspan/rowspan) based on their size
+        relative to the typical cell size.
+        
+        Args:
+            cells: List of detected cells
+            table_w, table_h: Table dimensions
+            
+        Returns:
+            list: Cells with updated merge information
+        """
+        if len(cells) < 2:
+            return cells
+        
+        # Calculate typical cell dimensions (use median to be robust to merged cells)
+        widths = sorted([c['width'] for c in cells])
+        heights = sorted([c['height'] for c in cells])
+        
+        # Use the smaller cells to estimate typical size (avoiding merged cells)
+        percentile = 0.3  # Use 30th percentile
+        typical_width = widths[int(len(widths) * percentile)]
+        typical_height = heights[int(len(heights) * percentile)]
+        
+        self.logger.info(f"Typical cell size: {typical_width}x{typical_height}")
+        
+        # Mark cells that are significantly larger as merged
+        for cell in cells:
+            colspan = round(cell['width'] / typical_width) if typical_width > 0 else 1
+            rowspan = round(cell['height'] / typical_height) if typical_height > 0 else 1
+            
+            if colspan > 1 or rowspan > 1:
+                cell['is_merged'] = True
+                cell['colspan'] = colspan
+                cell['rowspan'] = rowspan
+                self.logger.debug(f"Merged cell detected: colspan={colspan}, rowspan={rowspan}")
+            else:
+                cell['colspan'] = 1
+                cell['rowspan'] = 1
         
         return cells
 
     def _detect_cells_by_contours(self, binary_img, table_bounds, w, h):
-        """Detect cells using contour detection with multiple preprocessing (fallback method)."""
+        """Fallback: Detect cells using contour detection with multiple preprocessing."""
         cells = []
         
         # Scale morphology kernel with table size
