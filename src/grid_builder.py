@@ -9,7 +9,7 @@ import logging
 class GridBuilder:
     """Handles organization of cells into grid structure with rowspan and colspan calculations."""
     
-    def __init__(self, tolerance=10):  # Increased tolerance for better matching
+    def __init__(self, tolerance=10):
         """
         Initialize the GridBuilder.
         
@@ -42,7 +42,7 @@ class GridBuilder:
         
         # Log cell positions for debugging
         for i, cell in enumerate(sorted_cells):
-            self.logger.debug(f"Cell {i}: y1={cell['bounds']['y1']}, x1={cell['bounds']['x1']}, text='{cell['text'][:30]}'")
+            self.logger.debug(f"Cell {i}: y1={cell['bounds']['y1']}, x1={cell['bounds']['x1']}, text='{cell['text'][:30] if cell['text'] else ''}'")
         
         # Find unique positions with better merging
         row_positions_raw = [cell["bounds"]["y1"] for cell in sorted_cells]
@@ -83,17 +83,17 @@ class GridBuilder:
             
             # Process cells in this row
             for cell_idx, cell in row_cells:
-                col_idx = self._find_best_column_index(cell["bounds"]["x1"], col_positions)
+                col_idx = self._find_column_index(cell["bounds"]["x1"], col_positions)
                 
                 # Calculate spans based on cell dimensions
-                rowspan = self._calculate_rowspan_v2(cell, row_idx, row_positions, typical_row_height)
-                colspan = self._calculate_colspan_v2(cell, col_idx, col_positions, typical_col_width)
+                rowspan = self._calculate_rowspan(cell, row_idx, row_positions, typical_row_height)
+                colspan = self._calculate_colspan(cell, col_idx, col_positions, typical_col_width)
                 
                 # Ensure we don't exceed grid bounds
                 colspan = min(colspan, len(col_positions) - col_idx)
                 rowspan = min(rowspan, len(row_positions) - row_idx)
                 
-                self.logger.debug(f"Cell at row {row_idx}, col {col_idx}: rowspan={rowspan}, colspan={colspan}, text='{cell['text'][:30]}'")
+                self.logger.debug(f"Cell at row {row_idx}, col {col_idx}: rowspan={rowspan}, colspan={colspan}, text='{cell['text'][:30] if cell['text'] else ''}'")
                 
                 cell_info = {
                     "text": cell["text"],
@@ -108,19 +108,19 @@ class GridBuilder:
                     for c in range(col_idx, col_idx + colspan):
                         occupied_positions.add((r, c))
             
-            if current_row:  # Only add non-empty rows
+            if current_row:
                 grid.append(current_row)
 
-        # Check for any unplaced cells (should not happen)
+        # Log unplaced cells
         unplaced = len(sorted_cells) - len(placed_cells)
         if unplaced > 0:
             self.logger.warning(f"Warning: {unplaced} cells were not placed in the grid")
             for i, cell in enumerate(sorted_cells):
                 if i not in placed_cells:
-                    self.logger.debug(f"Unplaced cell: {cell['text'][:30]}, bounds: {cell['bounds']}")
+                    self.logger.debug(f"Unplaced cell: {cell['text'][:30] if cell['text'] else ''}, bounds: {cell['bounds']}")
 
         num_rows = len(grid)
-        num_cols = len(col_positions)  # Use the detected column count
+        num_cols = len(col_positions)
 
         self.logger.info(f"Final grid: {num_rows} rows with {len(placed_cells)} cells placed")
         
@@ -138,46 +138,41 @@ class GridBuilder:
             if pos - current_group[-1] <= self.tolerance:
                 current_group.append(pos)
             else:
-                # Add the average of the group
                 merged.append(sum(current_group) / len(current_group))
                 current_group = [pos]
         
-        # Don't forget the last group
         if current_group:
             merged.append(sum(current_group) / len(current_group))
         
         return merged
 
     def _calculate_typical_col_width(self, col_positions):
-        """Calculate typical column width."""
+        """Calculate typical column width using median."""
         if len(col_positions) > 1:
             col_widths = [
                 col_positions[i + 1] - col_positions[i]
                 for i in range(len(col_positions) - 1)
             ]
-            # Use median instead of mean to be more robust
             col_widths.sort()
             return col_widths[len(col_widths) // 2]
         return 100
 
     def _calculate_typical_row_height(self, row_positions):
-        """Calculate typical row height."""
+        """Calculate typical row height using median."""
         if len(row_positions) > 1:
             row_heights = [
                 row_positions[i + 1] - row_positions[i]
                 for i in range(len(row_positions) - 1)
             ]
-            # Use median instead of mean to be more robust
             row_heights.sort()
             return row_heights[len(row_heights) // 2]
         return 30
 
-    def _find_best_column_index(self, x_pos, col_positions):
+    def _find_column_index(self, x_pos, col_positions):
         """Find the best column index for a given x position."""
         if not col_positions:
             return 0
         
-        # Find the closest column position
         min_dist = float('inf')
         best_idx = 0
         
@@ -189,7 +184,7 @@ class GridBuilder:
         
         return best_idx
 
-    def _calculate_rowspan_v2(self, cell, row_idx, row_positions, typical_height):
+    def _calculate_rowspan(self, cell, row_idx, row_positions, typical_height):
         """Calculate rowspan based on cell height relative to typical row height."""
         if typical_height <= 0:
             return 1
@@ -197,7 +192,7 @@ class GridBuilder:
         cell_height = cell["bounds"]["y2"] - cell["bounds"]["y1"]
         
         # Calculate how many typical rows this cell spans
-        rowspan = max(1, round(cell_height / typical_height))
+        calculated_rowspan = max(1, round(cell_height / typical_height))
         
         # Verify against actual row positions
         actual_rowspan = 1
@@ -209,10 +204,9 @@ class GridBuilder:
             else:
                 break
         
-        # Use the minimum of calculated and actual to avoid exceeding bounds
-        return min(rowspan, actual_rowspan)
+        return max(calculated_rowspan, actual_rowspan)
 
-    def _calculate_colspan_v2(self, cell, col_idx, col_positions, typical_width):
+    def _calculate_colspan(self, cell, col_idx, col_positions, typical_width):
         """Calculate colspan based on cell width relative to typical column width."""
         if typical_width <= 0:
             return 1
@@ -220,7 +214,7 @@ class GridBuilder:
         cell_width = cell["bounds"]["x2"] - cell["bounds"]["x1"]
         
         # Calculate how many typical columns this cell spans
-        colspan = max(1, round(cell_width / typical_width))
+        calculated_colspan = max(1, round(cell_width / typical_width))
         
         # Verify against actual column positions
         actual_colspan = 1
@@ -232,5 +226,4 @@ class GridBuilder:
             else:
                 break
         
-        # Use the minimum of calculated and actual to avoid exceeding bounds
-        return min(colspan, actual_colspan)
+        return max(calculated_colspan, actual_colspan)
