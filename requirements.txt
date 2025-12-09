@@ -1,9 +1,4 @@
-# Core image processing and OCR
-opencv-python
-pytesseract
-pdf2image
-numpy
-matplotlib
+
 
 # Core linting and formatting tools
 black
@@ -15,3 +10,14 @@ mypy
 
 # Testing
 pytest
+
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+aiofiles==23.2.1
+opencv-python==4.8.1.78
+matplotlib==3.8.0
+numpy==1.24.3
+# Add your other OCR dependencies here
+pytesseract
+pdf2image
