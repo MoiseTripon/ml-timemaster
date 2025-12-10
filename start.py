@@ -70,34 +70,57 @@ class TableOCRProcessor:
         self.api_mode = api_mode
         self.logger = logging.getLogger(__name__)
         
-        # Make sure api_mode is NOT passed to these components
-        # They might be affected by the parameter
+        # Initialize components
         self.preprocessor = ImagePreprocessor()
-        self.table_detector = TableDetector(debug_mode=debug)  # NOT api_mode
-        self.ocr_processor = CellOCR(verbose_logging=debug)   # NOT api_mode
+        self.table_detector = TableDetector(debug_mode=debug)
+        self.ocr_processor = CellOCR(verbose_logging=debug)
         self.grid_builder = GridBuilder()
 
     def process_file(self, file_path):
         """Process a schedule file (PDF or image) and extract table data."""
         try:
-            # Add logging to track the process
             self.logger.info(f"[TableOCRProcessor] Processing file: {file_path}")
+            self.logger.info(f"[TableOCRProcessor] Debug mode: {self.debug}, API mode: {self.api_mode}")
             
             # Step 1: Preprocess the file
             processed_path, processed_img, original_img = self.preprocessor.preprocess(file_path)
             self.logger.info(f"[TableOCRProcessor] Preprocessed image shape: {processed_img.shape}")
             self.logger.info(f"[TableOCRProcessor] Original image shape: {original_img.shape}")
-
+            
+            # Log image statistics for debugging
+            import numpy as np
+            self.logger.debug(f"[TableOCRProcessor] Processed img min/max: {np.min(processed_img)}/{np.max(processed_img)}")
+            self.logger.debug(f"[TableOCRProcessor] Processed img dtype: {processed_img.dtype}")
+            
             # Step 2: Detect table borders and cells
             table_bounds = self.table_detector.detect_table_borders(processed_img)
             self.logger.info(f"[TableOCRProcessor] Table bounds: {table_bounds}")
             
             cells = self.table_detector.detect_cells(processed_img, table_bounds)
             self.logger.info(f"[TableOCRProcessor] Detected {len(cells)} cells")
+            
+            # Check if detection failed (only 1 cell detected for entire table)
+            if len(cells) == 1:
+                # Check if the single cell spans the entire table
+                single_cell = cells[0]
+                table_width = table_bounds["x2"] - table_bounds["x1"]
+                table_height = table_bounds["y2"] - table_bounds["y1"]
+                cell_width = single_cell["x2"] - single_cell["x1"]
+                cell_height = single_cell["y2"] - single_cell["y1"]
+                
+                # If the single cell is almost as large as the table, detection failed
+                if cell_width > table_width * 0.9 and cell_height > table_height * 0.9:
+                    self.logger.warning("[TableOCRProcessor] Table detection likely failed - single cell spans entire table")
+                    self.logger.warning("[TableOCRProcessor] This might be due to weak or missing internal table lines")
+                    
+                    # You could implement a fallback strategy here
+                    # For example, try different preprocessing parameters
+                    # or use a different detection algorithm
 
             if len(cells) == 0:
                 self.logger.error("No cells detected in the table")
                 raise ValueError("No cells were detected in the table")
+
             
             # Step 3: Extract text from each cell
             result = {"table_bounds": table_bounds, "cells": []}
@@ -160,7 +183,7 @@ class TableOCRProcessor:
                 },
             }
 
-            # Step 6: Create visualization
+            # # Step 6: Create visualization
             self._create_visualization(original_img, table_bounds, result["cells"], 
                                       response["visualization"]["output_file"], num_rows, num_cols)
                 

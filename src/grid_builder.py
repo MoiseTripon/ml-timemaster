@@ -29,20 +29,11 @@ class GridBuilder:
         Returns:
             tuple: (grid, num_rows, num_cols)
         """
-        self.logger.info("="*50)
-        self.logger.info("Starting grid organization")
-        self.logger.info(f"Input: {len(cells)} cells")
-        
         if not cells:
-            self.logger.warning("No cells to organize")
             return [], 0, 0
 
         # Sort cells by position (top-to-bottom, left-to-right)
         sorted_cells = sorted(cells, key=lambda c: (c["bounds"]["y1"], c["bounds"]["x1"]))
-        
-        # Log cell positions for debugging
-        for i, cell in enumerate(sorted_cells):
-            self.logger.debug(f"Cell {i}: y1={cell['bounds']['y1']}, x1={cell['bounds']['x1']}, text='{cell['text'][:30] if cell['text'] else ''}'")
         
         # Find unique positions with better merging
         row_positions_raw = [cell["bounds"]["y1"] for cell in sorted_cells]
@@ -51,78 +42,89 @@ class GridBuilder:
         row_positions = self._merge_close_positions(sorted(set(row_positions_raw)))
         col_positions = self._merge_close_positions(sorted(set(col_positions_raw)))
         
-        self.logger.info(f"Grid positions: {len(row_positions)} rows x {len(col_positions)} cols")
-        self.logger.debug(f"Row positions: {row_positions}")
-        self.logger.debug(f"Column positions: {col_positions}")
-
         # Calculate typical dimensions
         typical_col_width = self._calculate_typical_col_width(col_positions)
         typical_row_height = self._calculate_typical_row_height(row_positions)
 
-        # Create grid and track which cells have been placed
-        grid = []
-        occupied_positions = set()
-        placed_cells = set()
-
-        # Process each row
-        for row_idx, row_y in enumerate(row_positions):
-            current_row = []
-            
-            # Find all cells that belong to this row
-            row_cells = []
-            for cell_idx, cell in enumerate(sorted_cells):
-                if cell_idx in placed_cells:
-                    continue
-                    
-                # Check if cell starts in this row (with tolerance)
-                if abs(cell["bounds"]["y1"] - row_y) <= self.tolerance:
-                    row_cells.append((cell_idx, cell))
-            
-            # Sort row cells by x position
-            row_cells.sort(key=lambda x: x[1]["bounds"]["x1"])
-            
-            # Process cells in this row
-            for cell_idx, cell in row_cells:
-                col_idx = self._find_column_index(cell["bounds"]["x1"], col_positions)
-                
-                # Calculate spans based on cell dimensions
-                rowspan = self._calculate_rowspan(cell, row_idx, row_positions, typical_row_height)
-                colspan = self._calculate_colspan(cell, col_idx, col_positions, typical_col_width)
-                
-                # Ensure we don't exceed grid bounds
-                colspan = min(colspan, len(col_positions) - col_idx)
-                rowspan = min(rowspan, len(row_positions) - row_idx)
-                
-                self.logger.debug(f"Cell at row {row_idx}, col {col_idx}: rowspan={rowspan}, colspan={colspan}, text='{cell['text'][:30] if cell['text'] else ''}'")
-                
-                cell_info = {
-                    "text": cell["text"],
-                    "rowspan": rowspan,
-                    "colspan": colspan,
-                }
-                current_row.append(cell_info)
-                placed_cells.add(cell_idx)
-                
-                # Mark positions as occupied
-                for r in range(row_idx, row_idx + rowspan):
-                    for c in range(col_idx, col_idx + colspan):
-                        occupied_positions.add((r, c))
-            
-            if current_row:
-                grid.append(current_row)
-
-        # Log unplaced cells
-        unplaced = len(sorted_cells) - len(placed_cells)
-        if unplaced > 0:
-            self.logger.warning(f"Warning: {unplaced} cells were not placed in the grid")
-            for i, cell in enumerate(sorted_cells):
-                if i not in placed_cells:
-                    self.logger.debug(f"Unplaced cell: {cell['text'][:30] if cell['text'] else ''}, bounds: {cell['bounds']}")
-
-        num_rows = len(grid)
+        num_rows = len(row_positions)
         num_cols = len(col_positions)
 
-        self.logger.info(f"Final grid: {num_rows} rows with {len(placed_cells)} cells placed")
+        # Initialize a full grid structure - every position must have a cell
+        # Use None for cells that will be covered by spans
+        grid = [[None for _ in range(num_cols)] for _ in range(num_rows)]
+        placed_cells = set()
+
+        # Process each cell and place it in the grid
+        for cell_idx, cell in enumerate(sorted_cells):
+            # Find the starting row and column for this cell
+            row_idx = self._find_row_index(cell["bounds"]["y1"], row_positions)
+            col_idx = self._find_column_index(cell["bounds"]["x1"], col_positions)
+            
+            if row_idx is None or col_idx is None:
+                continue
+            
+            # Skip if this position is already occupied
+            if grid[row_idx][col_idx] is not None:
+                continue
+            
+            # Calculate spans based on cell dimensions
+            rowspan = self._calculate_rowspan(cell, row_idx, row_positions, typical_row_height)
+            colspan = self._calculate_colspan(cell, col_idx, col_positions, typical_col_width)
+            
+            # Ensure we don't exceed grid bounds
+            colspan = min(colspan, num_cols - col_idx)
+            rowspan = min(rowspan, num_rows - row_idx)
+            
+            # Create cell info with only text, rowspan, colspan
+            cell_info = {
+                "text": cell["text"],
+                "rowspan": rowspan,
+                "colspan": colspan
+            }
+            
+            # Place the cell in the grid
+            grid[row_idx][col_idx] = cell_info
+            placed_cells.add(cell_idx)
+            
+            # Mark all spanned positions as None (they will be skipped in rendering)
+            for r in range(row_idx, row_idx + rowspan):
+                for c in range(col_idx, col_idx + colspan):
+                    if r == row_idx and c == col_idx:
+                        continue  # Skip the main cell
+                    
+                    if r < num_rows and c < num_cols:
+                        grid[r][c] = None  # Mark as spanned
+
+        # Fill any remaining empty cells with empty text cells
+        for r in range(num_rows):
+            for c in range(num_cols):
+                if grid[r][c] is None:
+                    # Check if this is part of a span by looking at nearby cells
+                    is_spanned = False
+                    
+                    # Check cells above and to the left for spans that might cover this position
+                    for check_r in range(max(0, r - 10), r + 1):
+                        for check_c in range(max(0, c - 10), c + 1):
+                            if check_r >= num_rows or check_c >= num_cols:
+                                continue
+                            cell = grid[check_r][check_c]
+                            if cell and isinstance(cell, dict):
+                                # Check if this cell's span covers our position
+                                if (check_r + cell.get("rowspan", 1) > r and 
+                                    check_c + cell.get("colspan", 1) > c and
+                                    check_r <= r and check_c <= c):
+                                    is_spanned = True
+                                    break
+                        if is_spanned:
+                            break
+                    
+                    if not is_spanned:
+                        # This is a truly empty cell, not a spanned one
+                        grid[r][c] = {
+                            "text": "",
+                            "rowspan": 1,
+                            "colspan": 1
+                        }
         
         return grid, num_rows, num_cols
 
@@ -168,21 +170,27 @@ class GridBuilder:
             return row_heights[len(row_heights) // 2]
         return 30
 
+    def _find_row_index(self, y_pos, row_positions):
+        """Find the best row index for a given y position."""
+        if not row_positions:
+            return None
+        
+        for idx, row_y in enumerate(row_positions):
+            if abs(y_pos - row_y) <= self.tolerance:
+                return idx
+        
+        return None
+
     def _find_column_index(self, x_pos, col_positions):
         """Find the best column index for a given x position."""
         if not col_positions:
-            return 0
-        
-        min_dist = float('inf')
-        best_idx = 0
+            return None
         
         for idx, col_x in enumerate(col_positions):
-            dist = abs(x_pos - col_x)
-            if dist < min_dist:
-                min_dist = dist
-                best_idx = idx
+            if abs(x_pos - col_x) <= self.tolerance:
+                return idx
         
-        return best_idx
+        return None
 
     def _calculate_rowspan(self, cell, row_idx, row_positions, typical_height):
         """Calculate rowspan based on cell height relative to typical row height."""
