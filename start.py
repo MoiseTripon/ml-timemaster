@@ -61,25 +61,121 @@ def setup_logging(debug=False, log_level=logging.INFO):
     
     return root_logger
 
-
 class TableOCRProcessor:
     def __init__(self, debug=False, api_mode=False):
         """
         Initialize the Table OCR Processor.
-        
-        Args:
-            debug (bool): Enable debug mode
-            api_mode (bool): Running as API (disables GUI elements)
         """
         self.debug = debug
         self.api_mode = api_mode
         self.logger = logging.getLogger(__name__)
         
-        # Initialize components
+        # Make sure api_mode is NOT passed to these components
+        # They might be affected by the parameter
         self.preprocessor = ImagePreprocessor()
-        self.table_detector = TableDetector(debug_mode=debug)
-        self.ocr_processor = CellOCR(verbose_logging=debug)
+        self.table_detector = TableDetector(debug_mode=debug)  # NOT api_mode
+        self.ocr_processor = CellOCR(verbose_logging=debug)   # NOT api_mode
         self.grid_builder = GridBuilder()
+
+    def process_file(self, file_path):
+        """Process a schedule file (PDF or image) and extract table data."""
+        try:
+            # Add logging to track the process
+            self.logger.info(f"[TableOCRProcessor] Processing file: {file_path}")
+            
+            # Step 1: Preprocess the file
+            processed_path, processed_img, original_img = self.preprocessor.preprocess(file_path)
+            self.logger.info(f"[TableOCRProcessor] Preprocessed image shape: {processed_img.shape}")
+            self.logger.info(f"[TableOCRProcessor] Original image shape: {original_img.shape}")
+
+            # Step 2: Detect table borders and cells
+            table_bounds = self.table_detector.detect_table_borders(processed_img)
+            self.logger.info(f"[TableOCRProcessor] Table bounds: {table_bounds}")
+            
+            cells = self.table_detector.detect_cells(processed_img, table_bounds)
+            self.logger.info(f"[TableOCRProcessor] Detected {len(cells)} cells")
+
+            if len(cells) == 0:
+                self.logger.error("No cells detected in the table")
+                raise ValueError("No cells were detected in the table")
+            
+            # Step 3: Extract text from each cell
+            result = {"table_bounds": table_bounds, "cells": []}
+
+            for idx, cell in enumerate(cells):
+                try:
+                    # Log cell bounds before OCR
+                    self.logger.debug(f"[TableOCRProcessor] Processing cell {idx}: {cell}")
+                    
+                    text = self.ocr_processor.extract_cell_text(original_img, cell)
+                    
+                    # Log extracted text
+                    self.logger.debug(f"[TableOCRProcessor] Cell {idx} text: '{text}'")
+                    
+                    cell_info = {
+                        "id": idx,
+                        "bounds": {
+                            "x1": cell["x1"],
+                            "y1": cell["y1"],
+                            "x2": cell["x2"],
+                            "y2": cell["y2"],
+                        },
+                        "dimensions": {"width": cell["width"], "height": cell["height"]},
+                        "text": text,
+                    }
+                    result["cells"].append(cell_info)
+                except Exception as ocr_error:
+                    self.logger.error(f"[TableOCRProcessor] Error processing cell {idx}: {str(ocr_error)}")
+
+            # Log summary of extracted text
+            texts_found = [c["text"] for c in result["cells"] if c["text"].strip()]
+            self.logger.info(f"[TableOCRProcessor] Extracted {len(texts_found)} non-empty texts")
+            if texts_found:
+                self.logger.info(f"[TableOCRProcessor] Sample texts: {texts_found[:3]}")
+
+            # Step 4: Organize cells into grid structure
+            grid, num_rows, num_cols = self.grid_builder.organize_cells_into_grid(result["cells"])
+            self.logger.info(f"[TableOCRProcessor] Grid dimensions: {num_rows}x{num_cols}")
+
+
+            # Step 5: Create comprehensive response object
+            response = {
+                "metadata": {
+                    "file_name": os.path.basename(file_path),
+                    "file_type": "pdf" if file_path.lower().endswith(".pdf") else "image",
+                    "image_size": {
+                        "width": original_img.shape[1],
+                        "height": original_img.shape[0],
+                    },
+                    "processing_timestamp": str(datetime.datetime.now()),
+                },
+                "table": {
+                    "bounds": table_bounds,
+                    "dimensions": {"rows": num_rows, "columns": num_cols},
+                    "grid": grid,
+                    "cells": result["cells"],
+                },
+                "visualization": {
+                    "output_file": f"detected_table_{os.path.splitext(os.path.basename(file_path))[0]}.png"
+                },
+            }
+
+            # Step 6: Create visualization
+            self._create_visualization(original_img, table_bounds, result["cells"], 
+                                      response["visualization"]["output_file"], num_rows, num_cols)
+                
+            return response
+
+        except Exception as e:
+            self.logger.error(f"Error during processing: {str(e)}")
+            raise
+        finally:
+            # Clean up temporary files
+            if 'processed_path' in locals() and os.path.exists(processed_path):
+                try:
+                    os.remove(processed_path)
+                except OSError:
+                    pass
 
     def _create_visualization(self, img, table_bounds, cells, output_file, num_rows, num_cols):
         """Create and save visualization of detected table and cells."""
@@ -112,14 +208,17 @@ class TableOCRProcessor:
         cv2.imwrite(output_file, vis_img)
         self.logger.info(f"Saved visualization to {output_file}")
 
-        # Only display if not in API mode
-        if not self.api_mode:
-            plt.figure(figsize=(15, 12))
-            plt.imshow(cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB))
-            plt.axis("off")
-            plt.title(f"Detected Table and Cells ({num_rows}x{num_cols} grid)")
-            plt.show()
-
+        # Don't show matplotlib in API context - check if we're in a notebook/terminal
+        try:
+            import matplotlib
+            if matplotlib.get_backend() != 'Agg':  # Only show if not in headless mode
+                plt.figure(figsize=(15, 12))
+                plt.imshow(cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB))
+                plt.axis("off")
+                plt.title(f"Detected Table and Cells ({num_rows}x{num_cols} grid)")
+                plt.show()
+        except:
+            pass 
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Table OCR Processor')
