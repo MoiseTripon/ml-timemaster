@@ -49,12 +49,13 @@ class GridBuilder:
         num_rows = len(row_positions)
         num_cols = len(col_positions)
 
-        # Initialize a full grid structure - every position must have a cell
-        # Use None for cells that will be covered by spans
+        # Initialize a full grid structure - start with None everywhere
         grid = [[None for _ in range(num_cols)] for _ in range(num_rows)]
-        placed_cells = set()
+        
+        # Track which positions are explicitly covered by spans
+        span_coverage = set()
 
-        # Process each cell and place it in the grid
+        # First pass: Place all cells and mark their span coverage
         for cell_idx, cell in enumerate(sorted_cells):
             # Find the starting row and column for this cell
             row_idx = self._find_row_index(cell["bounds"]["y1"], row_positions)
@@ -63,7 +64,7 @@ class GridBuilder:
             if row_idx is None or col_idx is None:
                 continue
             
-            # Skip if this position is already occupied
+            # Skip if this position is already occupied by another cell
             if grid[row_idx][col_idx] is not None:
                 continue
             
@@ -84,47 +85,22 @@ class GridBuilder:
             
             # Place the cell in the grid
             grid[row_idx][col_idx] = cell_info
-            placed_cells.add(cell_idx)
             
-            # Mark all spanned positions as None (they will be skipped in rendering)
+            # Mark all positions covered by this cell's span
             for r in range(row_idx, row_idx + rowspan):
                 for c in range(col_idx, col_idx + colspan):
-                    if r == row_idx and c == col_idx:
-                        continue  # Skip the main cell
-                    
-                    if r < num_rows and c < num_cols:
-                        grid[r][c] = None  # Mark as spanned
+                    span_coverage.add((r, c))
 
-        # Fill any remaining empty cells with empty text cells
+        # Second pass: Fill remaining positions that aren't covered by spans
         for r in range(num_rows):
             for c in range(num_cols):
-                if grid[r][c] is None:
-                    # Check if this is part of a span by looking at nearby cells
-                    is_spanned = False
-                    
-                    # Check cells above and to the left for spans that might cover this position
-                    for check_r in range(max(0, r - 10), r + 1):
-                        for check_c in range(max(0, c - 10), c + 1):
-                            if check_r >= num_rows or check_c >= num_cols:
-                                continue
-                            cell = grid[check_r][check_c]
-                            if cell and isinstance(cell, dict):
-                                # Check if this cell's span covers our position
-                                if (check_r + cell.get("rowspan", 1) > r and 
-                                    check_c + cell.get("colspan", 1) > c and
-                                    check_r <= r and check_c <= c):
-                                    is_spanned = True
-                                    break
-                        if is_spanned:
-                            break
-                    
-                    if not is_spanned:
-                        # This is a truly empty cell, not a spanned one
-                        grid[r][c] = {
-                            "text": "",
-                            "rowspan": 1,
-                            "colspan": 1
-                        }
+                # If position not covered by any span, fill with empty cell
+                if (r, c) not in span_coverage:
+                    grid[r][c] = {
+                        "text": "",
+                        "rowspan": 1,
+                        "colspan": 1
+                    }
         
         return grid, num_rows, num_cols
 
