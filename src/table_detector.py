@@ -7,10 +7,11 @@ import logging
 import cv2
 import numpy as np
 import os
+from typing import List, Dict, Tuple, Set
 
 
 class TableDetector:
-    """Handles detection of table borders and individual cells using border-based approach."""
+    """Handles detection of table borders and individual cells using grid-based approach."""
     
     def __init__(self, debug_mode=False, debug_output_dir="debug_output"):
         """
@@ -38,10 +39,10 @@ class TableDetector:
 
     def detect_table_borders(self, img):
         """
-        Detect the main table borders in the image.
+        Step 1: Detect the main table region in the image.
         """
         self.logger.info("="*50)
-        self.logger.info("Starting table border detection")
+        self.logger.info("STEP 1: Detecting table region")
         
         if len(img.shape) == 3:
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -109,18 +110,11 @@ class TableDetector:
 
     def detect_cells(self, img, table_bounds):
         """
-        Detect cells using border-based approach.
-        
-        A cell is defined by the 4 lines that surround it:
-        - Top horizontal line
-        - Bottom horizontal line
-        - Left vertical line
-        - Right vertical line
-        
-        This approach naturally handles merged cells without falsely splitting them.
+        Main method to detect cells using the 5-step approach.
+        Returns cells with bounds that will be transformed by grid_builder.
         """
         self.logger.info("="*50)
-        self.logger.info("Starting cell detection using border-based approach")
+        self.logger.info("Starting cell detection using grid-based approach")
         
         x, y = table_bounds["x1"], table_bounds["y1"]
         w = table_bounds["x2"] - table_bounds["x1"]
@@ -134,34 +128,43 @@ class TableDetector:
         else:
             binary_img = table_region.copy()
         
-        # Step 1: Detect all horizontal and vertical lines
-        h_lines, v_lines = self._detect_lines(binary_img, w, h)
-        self.logger.info(f"Detected {len(h_lines)} horizontal and {len(v_lines)} vertical lines")
+        # Step 2: Detect horizontal and vertical ruling lines
+        h_lines, v_lines = self._detect_ruling_lines(binary_img, w, h)
         
-        # Step 2: Ensure table borders exist
-        h_lines = self._ensure_border_lines(h_lines, 'horizontal', w, h)
-        v_lines = self._ensure_border_lines(v_lines, 'vertical', w, h)
+        # Step 3: Build fine-grained grid including ALL lines (even partial ones)
+        h_grid_lines, v_grid_lines = self._build_complete_grid(h_lines, v_lines, w, h)
         
-        # Step 3: Find all possible cell rectangles defined by line borders
-        cells = self._find_cells_by_borders(h_lines, v_lines, binary_img, table_bounds, w, h)
+        # Step 3.5: Filter out tiny peripheral grid lines
+        h_grid_lines, v_grid_lines = self._filter_peripheral_gridlines(h_grid_lines, v_grid_lines, w, h)
         
-        self.logger.info(f"Found {len(cells)} cells")
+        # Step 4: Detect which grid boundaries have actual lines (barriers)
+        h_barriers, v_barriers = self._identify_line_barriers(
+            h_grid_lines, v_grid_lines, h_lines, v_lines, w, h
+        )
         
-        # Step 4: Remove duplicates and validate
-        cells = self._remove_duplicate_cells(cells)
+        # Step 5: Create cells considering all grid positions and merge where no barriers exist
+        cells = self._create_cells_with_spans(
+            h_grid_lines, v_grid_lines, h_barriers, v_barriers, table_bounds, w, h
+        )
         
-        self.logger.info(f"After deduplication: {len(cells)} cells")
+        self.logger.info(f"Found {len(cells)} cells after processing")
         
         # Debug visualization
         if self.debug_mode:
             self._save_debug_visualization(
-                binary_img, cells, table_bounds, h_lines, v_lines
+                binary_img, cells, table_bounds, h_grid_lines, v_grid_lines,
+                h_barriers, v_barriers
             )
         
         return cells
 
-    def _detect_lines(self, binary_img, w, h):
-        """Detect horizontal and vertical lines in the image."""
+    def _detect_ruling_lines(self, binary_img, w, h):
+        """
+        Step 2: Detect ALL horizontal and vertical ruling lines in the table.
+        Including partial lines that might define individual cells.
+        """
+        self.logger.info("STEP 2: Detecting all ruling lines")
+        
         h_kernel_width = min(max(int(w * 0.05), 20), 100)
         v_kernel_height = min(max(int(h * 0.05), 20), 100)
         
@@ -172,27 +175,29 @@ class TableDetector:
         
         self.save_debug_image(thresh, "threshold", "06")
         
-        # Detect horizontal lines
+        # Detect horizontal lines with lower threshold to catch all lines
         h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_kernel_width, 1))
-        h_lines_img = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, h_kernel, iterations=2)
-        h_lines_img = cv2.dilate(h_lines_img, h_kernel, iterations=1)
+        h_lines_img = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, h_kernel, iterations=1)  # Reduced iterations
         self.save_debug_image(h_lines_img, "horizontal_lines", "07a")
         
-        # Detect vertical lines
+        # Detect vertical lines with lower threshold to catch all lines
         v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_kernel_height))
-        v_lines_img = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, v_kernel, iterations=2)
-        v_lines_img = cv2.dilate(v_lines_img, v_kernel, iterations=1)
+        v_lines_img = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, v_kernel, iterations=1)  # Reduced iterations
         self.save_debug_image(v_lines_img, "vertical_lines", "07b")
         
-        h_lines = self._extract_line_segments(h_lines_img, 'horizontal', w, h)
-        v_lines = self._extract_line_segments(v_lines_img, 'vertical', w, h)
+        # Extract line segments with lower minimum length to catch cell dividers
+        h_lines = self._extract_all_line_segments(h_lines_img, 'horizontal', w, h)
+        v_lines = self._extract_all_line_segments(v_lines_img, 'vertical', w, h)
+        
+        self.logger.info(f"Detected {len(h_lines)} horizontal and {len(v_lines)} vertical line segments")
         
         return h_lines, v_lines
 
-    def _extract_line_segments(self, line_img, orientation, w, h):
-        """Extract line segments from binary image."""
+    def _extract_all_line_segments(self, line_img, orientation, w, h):
+        """Extract ALL line segments including small ones that might be cell dividers."""
         segments = []
-        min_length = max(10, min(w, h) * 0.02)
+        # Lower minimum length to catch cell dividers
+        min_length = max(10, min(w, h) * 0.01)  # Just 1% of dimension or 10 pixels
         
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
             line_img, connectivity=8
@@ -210,7 +215,9 @@ class TableDetector:
                         'y': int(centroids[i][1]),
                         'x1': comp_x,
                         'x2': comp_x + comp_w,
-                        'length': comp_w
+                        'length': comp_w,
+                        'thickness': comp_h,
+                        'extent_ratio': comp_w / w
                     })
             else:
                 if comp_h >= min_length and comp_w < comp_h * 0.5:
@@ -218,329 +225,395 @@ class TableDetector:
                         'x': int(centroids[i][0]),
                         'y1': comp_y,
                         'y2': comp_y + comp_h,
-                        'length': comp_h
+                        'length': comp_h,
+                        'thickness': comp_w,
+                        'extent_ratio': comp_h / h
                     })
         
-        segments = self._merge_segments(segments, orientation)
         return segments
 
-    def _merge_segments(self, segments, orientation, tolerance=12):
-        """Merge nearby parallel line segments."""
-        if not segments:
-            return segments
+    def _build_complete_grid(self, h_lines, v_lines, w, h):
+        """
+        Step 3: Build a complete grid using ALL detected lines.
+        This creates the finest possible grid to detect individual cells.
+        """
+        self.logger.info("STEP 3: Building complete grid from all lines")
+        
+        tolerance = 15
+        
+        # Get ALL unique horizontal positions
+        h_positions = []
+        for line in h_lines:
+            h_positions.append(line['y'])
+        
+        # Always add table borders
+        h_positions.append(0)
+        h_positions.append(h)
+        
+        # Merge only very close positions (likely duplicates)
+        h_grid_lines = self._merge_close_positions(sorted(set(h_positions)), tolerance)
+        
+        # Get ALL unique vertical positions
+        v_positions = []
+        for line in v_lines:
+            v_positions.append(line['x'])
+        
+        # Always add table borders
+        v_positions.append(0)
+        v_positions.append(w)
+        
+        # Merge only very close positions (likely duplicates)
+        v_grid_lines = self._merge_close_positions(sorted(set(v_positions)), tolerance)
+        
+        self.logger.info(f"Complete grid: {len(h_grid_lines)} horizontal x {len(v_grid_lines)} vertical lines")
+        
+        return h_grid_lines, v_grid_lines
+
+    def _merge_close_positions(self, positions, tolerance):
+        """Merge only positions that are very close (likely the same line detected multiple times)."""
+        if not positions:
+            return []
         
         merged = []
+        current_group = [positions[0]]
         
-        if orientation == 'horizontal':
-            segments.sort(key=lambda s: s['y'])
-            current = segments[0].copy()
-            
-            for seg in segments[1:]:
-                if abs(seg['y'] - current['y']) <= tolerance:
-                    current['x1'] = min(current['x1'], seg['x1'])
-                    current['x2'] = max(current['x2'], seg['x2'])
-                    current['y'] = (current['y'] + seg['y']) // 2
-                    current['length'] = current['x2'] - current['x1']
-                else:
-                    merged.append(current)
-                    current = seg.copy()
-            merged.append(current)
-        else:
-            segments.sort(key=lambda s: s['x'])
-            current = segments[0].copy()
-            
-            for seg in segments[1:]:
-                if abs(seg['x'] - current['x']) <= tolerance:
-                    current['y1'] = min(current['y1'], seg['y1'])
-                    current['y2'] = max(current['y2'], seg['y2'])
-                    current['x'] = (current['x'] + seg['x']) // 2
-                    current['length'] = current['y2'] - current['y1']
-                else:
-                    merged.append(current)
-                    current = seg.copy()
-            merged.append(current)
+        for pos in positions[1:]:
+            if pos - current_group[-1] <= tolerance:
+                current_group.append(pos)
+            else:
+                # Add the average of the group
+                merged.append(int(sum(current_group) / len(current_group)))
+                current_group = [pos]
+        
+        if current_group:
+            merged.append(int(sum(current_group) / len(current_group)))
         
         return merged
 
-    def _ensure_border_lines(self, lines, orientation, w, h):
-        """Ensure table border lines exist."""
-        tolerance = 15
+    def _filter_peripheral_gridlines(self, h_grid_lines, v_grid_lines, w, h):
+        """
+        Step 3.5: Filter out tiny peripheral grid lines that would create cells smaller than 10px.
+        Only removes grid lines at the edges that are too close to borders.
+        """
+        self.logger.info("STEP 3.5: Filtering peripheral grid lines")
         
-        if orientation == 'horizontal':
-            has_top = any(line['y'] < tolerance for line in lines)
-            if not has_top:
-                lines.append({'y': 0, 'x1': 0, 'x2': w, 'length': w})
-            
-            has_bottom = any(line['y'] > h - tolerance for line in lines)
-            if not has_bottom:
-                lines.append({'y': h, 'x1': 0, 'x2': w, 'length': w})
-        else:
-            has_left = any(line['x'] < tolerance for line in lines)
-            if not has_left:
-                lines.append({'x': 0, 'y1': 0, 'y2': h, 'length': h})
-            
-            has_right = any(line['x'] > w - tolerance for line in lines)
-            if not has_right:
-                lines.append({'x': w, 'y1': 0, 'y2': h, 'length': h})
+        min_cell_size = 20  # Minimum cell dimension in pixels
         
-        return lines
+        # Filter horizontal grid lines
+        filtered_h_lines = []
+        for i, line in enumerate(h_grid_lines):
+            # Keep first and last (borders)
+            if i == 0 or i == len(h_grid_lines) - 1:
+                filtered_h_lines.append(line)
+                continue
+            
+            # Check distance to previous line
+            prev_dist = line - filtered_h_lines[-1] if filtered_h_lines else h
+            
+            # Check distance to borders if at edges
+            if i == 1:  # Second line (first after top border)
+                if prev_dist < min_cell_size:
+                    self.logger.debug(f"Removing horizontal grid line at {line} (too close to top border)")
+                    continue
+            elif i == len(h_grid_lines) - 2:  # Second to last (before bottom border)
+                next_dist = h_grid_lines[i + 1] - line
+                if next_dist < min_cell_size:
+                    self.logger.debug(f"Removing horizontal grid line at {line} (too close to bottom border)")
+                    continue
+            
+            filtered_h_lines.append(line)
+        
+        # Filter vertical grid lines
+        filtered_v_lines = []
+        for i, line in enumerate(v_grid_lines):
+            # Keep first and last (borders)
+            if i == 0 or i == len(v_grid_lines) - 1:
+                filtered_v_lines.append(line)
+                continue
+            
+            # Check distance to previous line
+            prev_dist = line - filtered_v_lines[-1] if filtered_v_lines else w
+            
+            # Check distance to borders if at edges
+            if i == 1:  # Second line (first after left border)
+                if prev_dist < min_cell_size:
+                    self.logger.debug(f"Removing vertical grid line at {line} (too close to left border)")
+                    continue
+            elif i == len(v_grid_lines) - 2:  # Second to last (before right border)
+                next_dist = v_grid_lines[i + 1] - line
+                if next_dist < min_cell_size:
+                    self.logger.debug(f"Removing vertical grid line at {line} (too close to right border)")
+                    continue
+            
+            filtered_v_lines.append(line)
+        
+        # Additional pass: remove any internal lines that create tiny cells
+        final_h_lines = [filtered_h_lines[0]]  # Start with first line
+        for i in range(1, len(filtered_h_lines)):
+            if filtered_h_lines[i] - final_h_lines[-1] >= min_cell_size or i == len(filtered_h_lines) - 1:
+                final_h_lines.append(filtered_h_lines[i])
+            else:
+                self.logger.debug(f"Removing horizontal grid line at {filtered_h_lines[i]} (creates tiny cell)")
+        
+        final_v_lines = [filtered_v_lines[0]]  # Start with first line
+        for i in range(1, len(filtered_v_lines)):
+            if filtered_v_lines[i] - final_v_lines[-1] >= min_cell_size or i == len(filtered_v_lines) - 1:
+                final_v_lines.append(filtered_v_lines[i])
+            else:
+                self.logger.debug(f"Removing vertical grid line at {filtered_v_lines[i]} (creates tiny cell)")
+        
+        self.logger.info(f"Filtered grid: {len(final_h_lines)} horizontal x {len(final_v_lines)} vertical lines")
+        self.logger.info(f"Removed {len(h_grid_lines) - len(final_h_lines)} horizontal and {len(v_grid_lines) - len(final_v_lines)} vertical lines")
+        
+        return final_h_lines, final_v_lines
 
-    def _find_cells_by_borders(self, h_lines, v_lines, binary_img, table_bounds, table_w, table_h):
+    def _identify_line_barriers(self, h_grid_lines, v_grid_lines, h_lines, v_lines, w, h):
         """
-        Find cells by looking for rectangles formed by bordering lines.
+        Step 4: Identify which grid boundaries have actual line barriers.
+        A barrier exists where there's an actual line in the image.
+        """
+        self.logger.info("STEP 4: Identifying actual line barriers")
         
-        For each combination of 4 lines (top, bottom, left, right):
-        - Check if they form a valid rectangle
-        - Verify that these lines actually border a cell region
-        - Ensure the cell is not split by internal lines
+        tolerance = 15
+        # Lower coverage threshold to detect partial lines as barriers
+        min_coverage = 0.3  # Line must cover at least 30% of the cell boundary
+        
+        # Identify horizontal barriers (lines between rows)
+        h_barriers = set()
+        for i in range(len(h_grid_lines) - 1):
+            y_pos = h_grid_lines[i]
+            
+            # Check if there's any horizontal line at this position
+            for line in h_lines:
+                if abs(line['y'] - y_pos) <= tolerance:
+                    # This grid line has an actual line, mark all cells it crosses
+                    for j in range(len(v_grid_lines) - 1):
+                        x_start = v_grid_lines[j]
+                        x_end = v_grid_lines[j + 1]
+                        
+                        # Check if the line covers this cell boundary
+                        overlap_start = max(x_start, line['x1'])
+                        overlap_end = min(x_end, line['x2'])
+                        overlap = max(0, overlap_end - overlap_start)
+                        coverage = overlap / (x_end - x_start) if x_end > x_start else 0
+                        
+                        if coverage >= min_coverage:
+                            # Barrier between row i-1 and row i at column j
+                            if i > 0:
+                                h_barriers.add((i-1, j))
+        
+        # Identify vertical barriers (lines between columns)
+        v_barriers = set()
+        for j in range(len(v_grid_lines) - 1):
+            x_pos = v_grid_lines[j]
+            
+            # Check if there's any vertical line at this position
+            for line in v_lines:
+                if abs(line['x'] - x_pos) <= tolerance:
+                    # This grid line has an actual line, mark all cells it crosses
+                    for i in range(len(h_grid_lines) - 1):
+                        y_start = h_grid_lines[i]
+                        y_end = h_grid_lines[i + 1]
+                        
+                        # Check if the line covers this cell boundary
+                        overlap_start = max(y_start, line['y1'])
+                        overlap_end = min(y_end, line['y2'])
+                        overlap = max(0, overlap_end - overlap_start)
+                        coverage = overlap / (y_end - y_start) if y_end > y_start else 0
+                        
+                        if coverage >= min_coverage:
+                            # Barrier between column j-1 and column j at row i
+                            if j > 0:
+                                v_barriers.add((i, j-1))
+        
+        self.logger.info(f"Found {len(h_barriers)} horizontal and {len(v_barriers)} vertical barriers")
+        
+        return h_barriers, v_barriers
+
+    def _create_cells_with_spans(self, h_grid_lines, v_grid_lines, h_barriers, v_barriers,
+                                 table_bounds, w, h):
         """
+        Step 5: Create cells for each grid position and calculate spans.
+        Cells span multiple grid positions when there are no barriers between them.
+        """
+        self.logger.info("STEP 5: Creating cells with proper spans")
+        
+        num_rows = len(h_grid_lines) - 1
+        num_cols = len(v_grid_lines) - 1
+        
+        if num_rows == 0 or num_cols == 0:
+            self.logger.warning("No grid cells to process")
+            return []
+        
+        # Track which grid positions have been assigned to cells
+        assigned = [[False] * num_cols for _ in range(num_rows)]
         cells = []
         
-        # Sort lines for easier processing
-        h_lines_sorted = sorted(h_lines, key=lambda l: l['y'])
-        v_lines_sorted = sorted(v_lines, key=lambda l: l['x'])
-        
-        self.logger.info(f"Searching for cells among {len(h_lines_sorted)} h-lines and {len(v_lines_sorted)} v-lines")
-        
-        # Try each pair of horizontal lines (top and bottom)
-        for i, top_line in enumerate(h_lines_sorted):
-            for bottom_line in h_lines_sorted[i+1:]:
-                top_y = top_line['y']
-                bottom_y = bottom_line['y']
-                
-                # Skip if too small
-                cell_height = bottom_y - top_y
-                if cell_height < 10:
+        # Process each grid position
+        for row in range(num_rows):
+            for col in range(num_cols):
+                if assigned[row][col]:
                     continue
                 
-                # Try each pair of vertical lines (left and right)
-                for j, left_line in enumerate(v_lines_sorted):
-                    for right_line in v_lines_sorted[j+1:]:
-                        left_x = left_line['x']
-                        right_x = right_line['x']
-                        
-                        # Skip if too small
-                        cell_width = right_x - left_x
-                        if cell_width < 10:
-                            continue
-                        
-                        # Check if these 4 lines actually border a cell
-                        if self._is_valid_cell_border(
-                            top_line, bottom_line, left_line, right_line,
-                            top_y, bottom_y, left_x, right_x,
-                            h_lines_sorted, v_lines_sorted,
-                            binary_img, table_w, table_h
-                        ):
-                            cell = {
-                                "x1": left_x + table_bounds["x1"],
-                                "y1": top_y + table_bounds["y1"],
-                                "x2": right_x + table_bounds["x1"],
-                                "y2": bottom_y + table_bounds["y1"],
-                                "width": cell_width,
-                                "height": cell_height,
-                                "area": cell_width * cell_height,
-                            }
-                            cells.append(cell)
+                # Find how far this cell extends (no barriers means it spans multiple positions)
+                max_row, max_col = self._find_cell_extent(
+                    row, col, num_rows, num_cols, h_barriers, v_barriers, assigned
+                )
+                
+                # Calculate cell boundaries
+                x1 = v_grid_lines[col]
+                y1 = h_grid_lines[row]
+                x2 = v_grid_lines[max_col + 1]
+                y2 = h_grid_lines[max_row + 1]
+                
+                # No need to filter here since we already filtered the grid lines
+                # All cells created from the filtered grid will be >= 10px
+                
+                # Calculate spans
+                rowspan = max_row - row + 1
+                colspan = max_col - col + 1
+                
+                # Create cell
+                cell = {
+                    "x1": x1 + table_bounds["x1"],
+                    "y1": y1 + table_bounds["y1"],
+                    "x2": x2 + table_bounds["x1"],
+                    "y2": y2 + table_bounds["y1"],
+                    "width": x2 - x1,
+                    "height": y2 - y1,
+                    "area": (x2 - x1) * (y2 - y1),
+                    "grid_row": row,
+                    "grid_col": col,
+                    "rowspan": rowspan,
+                    "colspan": colspan
+                }
+                
+                cells.append(cell)
+                
+                # Mark all covered grid positions as assigned
+                for r in range(row, max_row + 1):
+                    for c in range(col, max_col + 1):
+                        assigned[r][c] = True
+        
+        # Log statistics
+        single_cells = [c for c in cells if c['rowspan'] == 1 and c['colspan'] == 1]
+        multi_cells = [c for c in cells if c['rowspan'] > 1 or c['colspan'] > 1]
+        self.logger.info(f"Created {len(cells)} cells from {num_rows}x{num_cols} grid")
+        self.logger.info(f"  - Single cells: {len(single_cells)}")
+        self.logger.info(f"  - Multi-span cells: {len(multi_cells)}")
+        if multi_cells:
+            max_rowspan = max(c['rowspan'] for c in cells)
+            max_colspan = max(c['colspan'] for c in cells)
+            self.logger.info(f"  - Max rowspan: {max_rowspan}, Max colspan: {max_colspan}")
         
         return cells
 
-    def _is_valid_cell_border(self, top_line, bottom_line, left_line, right_line,
-                               top_y, bottom_y, left_x, right_x,
-                               all_h_lines, all_v_lines,
-                               binary_img, table_w, table_h):
+    def _find_cell_extent(self, row, col, num_rows, num_cols, h_barriers, v_barriers, assigned):
         """
-        Check if 4 lines form a valid cell border.
-        
-        Criteria:
-        1. The lines must actually overlap the cell boundaries (coverage check)
-        2. There must be NO internal horizontal line that fully crosses the cell
-        3. There must be NO internal vertical line that fully crosses the cell
-        4. The region should not be completely empty (optional)
+        Find how far a cell extends from (row, col) position.
+        A cell extends until it hits a barrier or an already assigned position.
         """
-        tolerance = 15
-        coverage_threshold = 0.5  # Line must cover at least 50% of the border
+        max_row = row
+        max_col = col
         
-        cell_width = right_x - left_x
-        cell_height = bottom_y - top_y
+        # First, expand right as far as possible (check for vertical barriers)
+        for c in range(col + 1, num_cols):
+            # Check if already assigned
+            if assigned[row][c]:
+                break
+            # Check if there's a vertical barrier between c-1 and c
+            if (row, c-1) in v_barriers:
+                break
+            max_col = c
         
-        # Check 1: Top line must cover the top border
-        top_coverage = self._calculate_line_coverage(
-            top_line, left_x, right_x, 'horizontal'
-        )
-        if top_coverage < coverage_threshold:
-            return False
-        
-        # Check 2: Bottom line must cover the bottom border
-        bottom_coverage = self._calculate_line_coverage(
-            bottom_line, left_x, right_x, 'horizontal'
-        )
-        if bottom_coverage < coverage_threshold:
-            return False
-        
-        # Check 3: Left line must cover the left border
-        left_coverage = self._calculate_line_coverage(
-            left_line, top_y, bottom_y, 'vertical'
-        )
-        if left_coverage < coverage_threshold:
-            return False
-        
-        # Check 4: Right line must cover the right border
-        right_coverage = self._calculate_line_coverage(
-            right_line, top_y, bottom_y, 'vertical'
-        )
-        if right_coverage < coverage_threshold:
-            return False
-        
-        # Check 5: No internal horizontal line should fully split the cell
-        for h_line in all_h_lines:
-            if h_line['y'] <= top_y + tolerance or h_line['y'] >= bottom_y - tolerance:
-                continue  # This is the border or outside
-            
-            # This is an internal horizontal line
-            # Check if it fully crosses the cell
-            line_left = h_line['x1']
-            line_right = h_line['x2']
-            
-            # Calculate how much of the cell width this line covers
-            overlap_left = max(left_x, line_left)
-            overlap_right = min(right_x, line_right)
-            overlap_width = max(0, overlap_right - overlap_left)
-            
-            coverage = overlap_width / cell_width if cell_width > 0 else 0
-            
-            # If the line covers most of the cell width, it splits the cell
-            if coverage > 0.7:
-                return False
-        
-        # Check 6: No internal vertical line should fully split the cell
-        for v_line in all_v_lines:
-            if v_line['x'] <= left_x + tolerance or v_line['x'] >= right_x - tolerance:
-                continue  # This is the border or outside
-            
-            # This is an internal vertical line
-            line_top = v_line['y1']
-            line_bottom = v_line['y2']
-            
-            overlap_top = max(top_y, line_top)
-            overlap_bottom = min(bottom_y, line_bottom)
-            overlap_height = max(0, overlap_bottom - overlap_top)
-            
-            coverage = overlap_height / cell_height if cell_height > 0 else 0
-            
-            if coverage > 0.7:
-                return False
-        
-        # All checks passed
-        return True
-
-    def _calculate_line_coverage(self, line, start, end, orientation):
-        """
-        Calculate how much of a border segment a line covers.
-        
-        Args:
-            line: The line dictionary
-            start: Start of the border segment (x for horizontal, y for vertical)
-            end: End of the border segment
-            orientation: 'horizontal' or 'vertical'
-            
-        Returns:
-            Coverage ratio (0.0 to 1.0)
-        """
-        border_length = end - start
-        if border_length <= 0:
-            return 0.0
-        
-        if orientation == 'horizontal':
-            line_start = line['x1']
-            line_end = line['x2']
-        else:
-            line_start = line['y1']
-            line_end = line['y2']
-        
-        # Calculate overlap
-        overlap_start = max(start, line_start)
-        overlap_end = min(end, line_end)
-        overlap = max(0, overlap_end - overlap_start)
-        
-        coverage = overlap / border_length
-        return coverage
-
-    def _remove_duplicate_cells(self, cells, overlap_threshold=0.8):
-        """
-        Remove duplicate cells that overlap significantly.
-        
-        When we have nested rectangles (e.g., a merged cell and the sub-cells
-        it should contain), keep the appropriate ones based on area and coverage.
-        """
-        if not cells:
-            return []
-        
-        # Sort by area (smaller first, so we prefer larger cells when there's overlap)
-        cells_sorted = sorted(cells, key=lambda c: c['area'])
-        
-        unique_cells = []
-        
-        for cell in cells_sorted:
-            is_duplicate = False
-            
-            for unique_cell in unique_cells:
-                overlap = self._calculate_cell_overlap(cell, unique_cell)
-                
-                # If this cell is almost entirely contained in an existing cell, skip it
-                if overlap > overlap_threshold:
-                    is_duplicate = True
+        # Then, expand down as far as possible (check for horizontal barriers)
+        can_expand_down = True
+        for r in range(row + 1, num_rows):
+            # Check all columns in the current span
+            for c in range(col, max_col + 1):
+                # Check if already assigned
+                if assigned[r][c]:
+                    can_expand_down = False
+                    break
+                # Check for horizontal barrier between r-1 and r
+                if (r-1, c) in h_barriers:
+                    can_expand_down = False
                     break
             
-            if not is_duplicate:
-                unique_cells.append(cell)
+            if not can_expand_down:
+                break
+            
+            # Also verify no vertical barriers split the cell at this row
+            for c in range(col, max_col):
+                if (r, c) in v_barriers:
+                    can_expand_down = False
+                    break
+            
+            if not can_expand_down:
+                break
+            
+            max_row = r
         
-        return unique_cells
-
-    def _calculate_cell_overlap(self, cell1, cell2):
-        """Calculate overlap ratio between two cells."""
-        x_left = max(cell1['x1'], cell2['x1'])
-        y_top = max(cell1['y1'], cell2['y1'])
-        x_right = min(cell1['x2'], cell2['x2'])
-        y_bottom = min(cell1['y2'], cell2['y2'])
-        
-        if x_right <= x_left or y_bottom <= y_top:
-            return 0.0
-        
-        overlap_area = (x_right - x_left) * (y_bottom - y_top)
-        smaller_area = min(cell1['area'], cell2['area'])
-        
-        return overlap_area / smaller_area if smaller_area > 0 else 0.0
+        return max_row, max_col
 
     def _save_debug_visualization(self, binary_img, cells, table_bounds,
-                                   h_lines, v_lines):
+                                   h_grid_lines, v_grid_lines,
+                                   h_barriers, v_barriers):
         """Save debug visualization."""
-        # Lines visualization
-        lines_img = cv2.cvtColor(binary_img, cv2.COLOR_GRAY2BGR)
+        # Grid visualization
+        grid_img = cv2.cvtColor(binary_img, cv2.COLOR_GRAY2BGR)
         
-        for line in h_lines:
-            cv2.line(lines_img, (line['x1'], line['y']), (line['x2'], line['y']), 
-                    (255, 0, 0), 2)
+        # Draw all grid lines (thin)
+        for y in h_grid_lines:
+            cv2.line(grid_img, (0, y), (grid_img.shape[1], y), (200, 200, 200), 1)
         
-        for line in v_lines:
-            cv2.line(lines_img, (line['x'], line['y1']), (line['x'], line['y2']), 
-                    (0, 255, 0), 2)
+        for x in v_grid_lines:
+            cv2.line(grid_img, (x, 0), (x, grid_img.shape[0]), (200, 200, 200), 1)
         
-        self.save_debug_image(lines_img, "detected_lines", "08")
+        # Draw barriers (thick)
+        for (row, col) in h_barriers:
+            if row + 1 < len(h_grid_lines) and col < len(v_grid_lines) - 1:
+                y = h_grid_lines[row + 1]
+                x1 = v_grid_lines[col]
+                x2 = v_grid_lines[col + 1]
+                cv2.line(grid_img, (x1, y), (x2, y), (0, 0, 255), 2)
+        
+        for (row, col) in v_barriers:
+            if col + 1 < len(v_grid_lines) and row < len(h_grid_lines) - 1:
+                x = v_grid_lines[col + 1]
+                y1 = h_grid_lines[row]
+                y2 = h_grid_lines[row + 1]
+                cv2.line(grid_img, (x, y1), (x, y2), (0, 0, 255), 2)
+        
+        self.save_debug_image(grid_img, "grid_with_barriers", "08")
         
         # Cells visualization
         cells_img = cv2.cvtColor(binary_img, cv2.COLOR_GRAY2BGR)
         
-        for i, cell in enumerate(cells):
+        # Sort cells by area to draw smaller ones last (on top)
+        sorted_cells = sorted(cells, key=lambda c: c['area'], reverse=True)
+        
+        for i, cell in enumerate(sorted_cells):
             x1 = cell['x1'] - table_bounds['x1']
             y1 = cell['y1'] - table_bounds['y1']
             x2 = cell['x2'] - table_bounds['x1']
             y2 = cell['y2'] - table_bounds['y1']
             
-            # Random color for each cell
-            color = ((i * 37) % 256, (i * 67) % 256, (i * 97) % 256)
+            # Use different colors for cells with different spans
+            if cell['rowspan'] > 1 or cell['colspan'] > 1:
+                # Multi-span cells in blue shades
+                color = (255 - i*10 % 100, 100, 100)
+            else:
+                # Single cells in green shades
+                color = (100, 255 - i*10 % 100, 100)
             
-            cv2.rectangle(cells_img, (x1+2, y1+2), (x2-2, y2-2), color, 2)
-            cv2.putText(cells_img, str(i), (x1+5, y1+20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            cv2.rectangle(cells_img, (x1+1, y1+1), (x2-1, y2-1), color, 2)
+            
+            # Add cell info
+            info = f"r{cell['grid_row']}c{cell['grid_col']}: {cell['rowspan']}x{cell['colspan']}"
+            font_scale = 0.3
+            thickness = 1
+            cv2.putText(cells_img, info, (x1+3, y1+12),
+                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness)
         
         self.save_debug_image(cells_img, "detected_cells", "09")

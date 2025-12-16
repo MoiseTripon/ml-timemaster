@@ -24,56 +24,106 @@ class GridBuilder:
         """
         Organize cells into a 2D grid structure.
         
-        Since cells are defined by their borders, we need to:
-        1. Determine grid positions from cell boundaries
-        2. Calculate rowspan/colspan based on cell size vs typical cell size
-        3. Place cells in grid and handle overlaps
+        Cells come from the detector with grid information already computed.
+        We need to:
+        1. Transform the detector output to the expected bounds format
+        2. Place cells in grid using their pre-computed positions and spans
+        3. Handle any remaining gaps
         """
         if not cells:
             return [], 0, 0
 
+        # Transform cells to have bounds dictionary format
+        formatted_cells = []
+        for cell in cells:
+            # Check if cell already has bounds format
+            if "bounds" in cell:
+                formatted_cells.append(cell)
+            else:
+                # Transform from detector format (x1, y1, x2, y2) to bounds format
+                formatted_cell = {
+                    "bounds": {
+                        "x1": cell.get("x1", 0),
+                        "y1": cell.get("y1", 0),
+                        "x2": cell.get("x2", 0),
+                        "y2": cell.get("y2", 0)
+                    },
+                    "text": cell.get("text", ""),
+                    "grid_row": cell.get("grid_row", 0),
+                    "grid_col": cell.get("grid_col", 0),
+                    "rowspan": cell.get("rowspan", 1),
+                    "colspan": cell.get("colspan", 1)
+                }
+                formatted_cells.append(formatted_cell)
+
         # Sort cells by position
-        sorted_cells = sorted(cells, key=lambda c: (c["bounds"]["y1"], c["bounds"]["x1"]))
+        sorted_cells = sorted(formatted_cells, key=lambda c: (
+            c.get("grid_row", c["bounds"]["y1"]), 
+            c.get("grid_col", c["bounds"]["x1"])
+        ))
         
-        # Get unique row and column positions
-        row_positions = self._get_unique_positions([c["bounds"]["y1"] for c in sorted_cells])
-        row_positions.append(max(c["bounds"]["y2"] for c in sorted_cells))  # Add bottom edges
-        row_positions = sorted(set(row_positions))
-        
-        col_positions = self._get_unique_positions([c["bounds"]["x1"] for c in sorted_cells])
-        col_positions.append(max(c["bounds"]["x2"] for c in sorted_cells))  # Add right edges
-        col_positions = sorted(set(col_positions))
-        
-        num_rows = len(row_positions) - 1
-        num_cols = len(col_positions) - 1
+        # Determine grid dimensions from pre-computed grid positions
+        if all("grid_row" in c and "grid_col" in c for c in sorted_cells):
+            # Use pre-computed grid positions
+            num_rows = max(c.get("grid_row", 0) + c.get("rowspan", 1) for c in sorted_cells)
+            num_cols = max(c.get("grid_col", 0) + c.get("colspan", 1) for c in sorted_cells)
+        else:
+            # Fall back to computing from boundaries
+            row_positions = self._get_unique_positions([c["bounds"]["y1"] for c in sorted_cells])
+            row_positions.append(max(c["bounds"]["y2"] for c in sorted_cells))
+            row_positions = sorted(set(row_positions))
+            
+            col_positions = self._get_unique_positions([c["bounds"]["x1"] for c in sorted_cells])
+            col_positions.append(max(c["bounds"]["x2"] for c in sorted_cells))
+            col_positions = sorted(set(col_positions))
+            
+            num_rows = len(row_positions) - 1
+            num_cols = len(col_positions) - 1
         
         self.logger.info(f"Grid dimensions: {num_rows} rows x {num_cols} columns")
         
         if num_rows < 1 or num_cols < 1:
             return [], 0, 0
         
-        # Calculate typical cell dimensions
-        typical_width = self._calculate_typical_dimension(
-            [c["bounds"]["x2"] - c["bounds"]["x1"] for c in sorted_cells]
-        )
-        typical_height = self._calculate_typical_dimension(
-            [c["bounds"]["y2"] - c["bounds"]["y1"] for c in sorted_cells]
-        )
-        
-        self.logger.info(f"Typical cell size: {typical_width:.1f} x {typical_height:.1f}")
-        
         # Initialize grid
         grid = [[None for _ in range(num_cols)] for _ in range(num_rows)]
         span_coverage: Set[Tuple[int, int]] = set()
         
-        # Place cells in grid
+        # Place cells in grid - process in order to handle overlaps correctly
         for cell in sorted_cells:
-            row_idx = self._find_position_index(cell["bounds"]["y1"], row_positions)
-            col_idx = self._find_position_index(cell["bounds"]["x1"], col_positions)
-            
-            if row_idx is None or col_idx is None:
-                self.logger.warning(f"Could not place cell at ({cell['bounds']['x1']}, {cell['bounds']['y1']})")
-                continue
+            # Get position from pre-computed values or calculate
+            if "grid_row" in cell and "grid_col" in cell:
+                row_idx = cell["grid_row"]
+                col_idx = cell["grid_col"]
+                rowspan = cell.get("rowspan", 1)
+                colspan = cell.get("colspan", 1)
+            else:
+                # Fall back to calculating from bounds
+                if 'row_positions' not in locals():
+                    row_positions = self._get_unique_positions([c["bounds"]["y1"] for c in sorted_cells])
+                    row_positions.append(max(c["bounds"]["y2"] for c in sorted_cells))
+                    row_positions = sorted(set(row_positions))
+                    
+                    col_positions = self._get_unique_positions([c["bounds"]["x1"] for c in sorted_cells])
+                    col_positions.append(max(c["bounds"]["x2"] for c in sorted_cells))
+                    col_positions = sorted(set(col_positions))
+                
+                row_idx = self._find_position_index(cell["bounds"]["y1"], row_positions)
+                col_idx = self._find_position_index(cell["bounds"]["x1"], col_positions)
+                
+                if row_idx is None or col_idx is None:
+                    self.logger.warning(f"Could not place cell at ({cell['bounds']['x1']}, {cell['bounds']['y1']})")
+                    continue
+                
+                # Calculate spans
+                rowspan = self._calculate_span(
+                    cell["bounds"]["y1"], cell["bounds"]["y2"],
+                    row_positions, None
+                )
+                colspan = self._calculate_span(
+                    cell["bounds"]["x1"], cell["bounds"]["x2"],
+                    col_positions, None
+                )
             
             if row_idx >= num_rows or col_idx >= num_cols:
                 continue
@@ -81,25 +131,16 @@ class GridBuilder:
             if (row_idx, col_idx) in span_coverage:
                 continue
             
-            # Calculate spans based on cell boundaries
-            rowspan = self._calculate_span(
-                cell["bounds"]["y1"], cell["bounds"]["y2"],
-                row_positions, typical_height
-            )
-            colspan = self._calculate_span(
-                cell["bounds"]["x1"], cell["bounds"]["x2"],
-                col_positions, typical_width
-            )
-            
-            # Ensure spans are valid
+            # Ensure spans are valid and within bounds
             rowspan = max(1, min(rowspan, num_rows - row_idx))
             colspan = max(1, min(colspan, num_cols - col_idx))
             
-            # Check for conflicts
+            # Check for conflicts and adjust spans
             rowspan, colspan = self._adjust_for_conflicts(
                 row_idx, col_idx, rowspan, colspan, span_coverage, num_rows, num_cols
             )
             
+            # Create cell with ONLY text, rowspan, colspan
             cell_info = {
                 "text": cell.get("text", ""),
                 "rowspan": rowspan,
@@ -113,13 +154,26 @@ class GridBuilder:
                 for c in range(col_idx, col_idx + colspan):
                     span_coverage.add((r, c))
         
-        # Fill gaps
+        # Fill gaps - cells not covered by any span
         for r in range(num_rows):
             for c in range(num_cols):
-                if grid[r][c] is None:
+                if grid[r][c] is None and (r, c) not in span_coverage:
                     grid[r][c] = {"text": "", "rowspan": 1, "colspan": 1}
         
-        # Validate
+        # Set None for positions covered by spans (except origin cells)
+        for r in range(num_rows):
+            for c in range(num_cols):
+                if grid[r][c] is not None:
+                    rowspan = grid[r][c].get("rowspan", 1)
+                    colspan = grid[r][c].get("colspan", 1)
+                    
+                    # Mark spanned positions as None
+                    for sr in range(r, min(r + rowspan, num_rows)):
+                        for sc in range(c, min(c + colspan, num_cols)):
+                            if sr != r or sc != c:
+                                grid[sr][sc] = None
+        
+        # Final validation
         grid = self._validate_grid(grid, num_rows, num_cols)
         
         return grid, num_rows, num_cols
@@ -173,7 +227,7 @@ class GridBuilder:
         return best_idx if min_dist <= self.tolerance * 2 else None
 
     def _calculate_span(self, start: float, end: float, 
-                        positions: List[float], typical_size: float) -> int:
+                        positions: List[float], typical_size: Optional[float]) -> int:
         """
         Calculate span based on how many grid positions the cell covers.
         """
@@ -182,7 +236,11 @@ class GridBuilder:
             next_pos = positions[i + 1]
             
             # Check if this grid cell is within the cell's boundaries
-            if pos >= start - self.tolerance and next_pos <= end + self.tolerance:
+            # Using a slightly more lenient check for long spanning cells
+            cell_start = start - self.tolerance
+            cell_end = end + self.tolerance
+            
+            if pos >= cell_start and next_pos <= cell_end:
                 span += 1
             elif pos >= end:
                 break
@@ -193,7 +251,22 @@ class GridBuilder:
                                rowspan: int, colspan: int,
                                covered: Set[Tuple[int, int]],
                                num_rows: int, num_cols: int) -> Tuple[int, int]:
-        """Adjust spans to avoid conflicts."""
+        """Adjust spans to avoid conflicts with already placed cells."""
+        # First check if original spans work
+        has_conflict = False
+        for r in range(row_idx, min(row_idx + rowspan, num_rows)):
+            for c in range(col_idx, min(col_idx + colspan, num_cols)):
+                if (r, c) in covered:
+                    has_conflict = True
+                    break
+            if has_conflict:
+                break
+        
+        if not has_conflict:
+            return rowspan, colspan
+        
+        # Try to find the best non-conflicting spans
+        # Strategy: try reducing colspan first, then rowspan
         new_colspan = colspan
         while new_colspan > 1:
             conflict = False
@@ -226,17 +299,20 @@ class GridBuilder:
 
     def _validate_grid(self, grid: List[List[Optional[Dict]]], 
                        num_rows: int, num_cols: int) -> List[List[Dict]]:
-        """Validate grid structure."""
+        """Validate grid structure and ensure consistency."""
         if not grid:
             return grid
         
         for r in range(num_rows):
             for c in range(num_cols):
-                if grid[r][c] is None:
-                    grid[r][c] = {"text": "", "rowspan": 1, "colspan": 1}
-                
-                cell = grid[r][c]
-                cell["colspan"] = max(1, min(cell.get("colspan", 1), num_cols - c))
-                cell["rowspan"] = max(1, min(cell.get("rowspan", 1), num_rows - r))
+                if grid[r][c] is not None:
+                    cell = grid[r][c]
+                    # Ensure only text, rowspan, colspan keys exist
+                    validated_cell = {
+                        "text": cell.get("text", ""),
+                        "rowspan": max(1, min(cell.get("rowspan", 1), num_rows - r)),
+                        "colspan": max(1, min(cell.get("colspan", 1), num_cols - c))
+                    }
+                    grid[r][c] = validated_cell
         
         return grid
