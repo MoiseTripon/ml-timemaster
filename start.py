@@ -131,7 +131,8 @@ class TableOCRProcessor:
                     self.logger.debug(f"[TableOCRProcessor] Processing cell {idx}: {cell}")
                     
                     text = self.ocr_processor.extract_cell_text(original_img, cell)
-                    
+                    # debug_info = self.ocr_processor.debug_cell(original_img, cell, save_path="./debug_output")
+                    # print(debug_info)
                     # Log extracted text
                     self.logger.debug(f"[TableOCRProcessor] Cell {idx} text: '{text}'")
                     
