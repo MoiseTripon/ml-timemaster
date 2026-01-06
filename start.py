@@ -73,7 +73,7 @@ class TableOCRProcessor:
         # Initialize components
         self.preprocessor = ImagePreprocessor()
         self.table_detector = TableDetector(debug_mode=debug)
-        self.ocr_processor = CellOCR(verbose_logging=debug)
+        self.ocr_processor = CellOCR(verbose_logging=debug, dictionary_path="src/ocr_dictionary.json")
         self.grid_builder = GridBuilder()
 
     def process_file(self, file_path):

@@ -1,0 +1,113 @@
+{
+  "terms": {
+    "days": [
+      "Monday",
+      "Tuesday",
+      "Wednesday",
+      "Thursday",
+      "Friday"
+    ],
+    "subjects": [
+      "Mathematics",
+      "Physics",
+      "Computer",
+      "Science",
+      "Design",
+      "Machine",
+      "Learning",
+      "Software",
+      "Engineering"
+    ],
+    "schedule_terms": [
+      "Lecture",
+      "Tutorial",
+      "Lab",
+      "Seminar",
+      "Exam"
+    ],
+    "custom": []
+  },
+  "word_corrections": {
+    "Design": [
+      "Dcsign",
+      "DeBlgn",
+      "Des1gn",
+      "Desiqn",
+      "Deslgn"
+    ],
+    "Machine": [
+      "Mach1ne",
+      "Machirie",
+      "Machlne"
+    ],
+    "Learning": [
+      "Learn1ng",
+      "Learninq",
+      "Learnlng"
+    ],
+    "Computer": [
+      "C0mputer",
+      "Computcr",
+      "Cornputer"
+    ],
+    "Science": [
+      "Sc1ence",
+      "Sciencc",
+      "Sclence"
+    ],
+    "Software": [
+      "S0ftware",
+      "Softwarc"
+    ],
+    "Engineering": [
+      "Engineer1ng",
+      "Englneering"
+    ],
+    "Monday": [
+      "M0nday",
+      "Mond4y",
+      "Mondav"
+    ],
+    "Tuesday": [
+      "Tu3sday",
+      "Tuesd4y"
+    ],
+    "Wednesday": [
+      "Wedn3sday",
+      "Wednesd4y"
+    ],
+    "Thursday": [
+      "Thursd4y"
+    ],
+    "Friday": [
+      "Fr1day",
+      "Frid4y"
+    ],
+    "Lecture": [
+      "Lcture",
+      "Lectur3",
+      "Lecturc"
+    ],
+    "Room": [
+      "R0om",
+      "Roorn"
+    ],
+    "dr.": [
+      "dr,"
+    ],
+    "INFORMATICA": [
+      "INEORMATICA"
+    ]
+  },
+  "phrase_corrections": {
+    "INFORMATICA APLICATA C PO3 Prof. dr. ing S Meza": [
+      "INEORMATICA APLICATAC PO3 PrOf. dr. ing S MELA"
+    ],
+    "ANALIZA MATEMATICA C PO3 Conf. dr. D Otrocol": [
+      "ANALILAMATEMATICAC PO3 CoIf, dr. DOtrOCO"
+    ],
+    "PSIHOLOGIA EDUCATIEI E 42 Zectar dr. G Tri( - FACULTATIV com. ANH I": [
+      "PSMADLDGRA EDUCATIEI E 42 Zectar dr. G Tri( - FACULTATIV com. ANH I"
+    ]
+  }
+}

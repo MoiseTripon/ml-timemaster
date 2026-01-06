@@ -1,20 +1,20 @@
 """
-OCR module for ML Timemaster.
-Contains the CellOCR class for extracting text from table cells.
-Uses PaddleOCR for text recognition, optimized for Apple Silicon.
+OCR module for ML Timemaster with Word-Level Correction.
+Compatible with PaddleOCR 3.3.2 and PaddlePaddle 3.2.2
 """
 
 import logging
 import cv2
 import numpy as np
-from src.performance_logger import LogContext, timed_operation
 import re
-from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict, Any
-import threading
-import tempfile
+import json
 import os
-import inspect
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional, Dict, Any, Set
+from difflib import SequenceMatcher
+import threading
+import time
+from collections import defaultdict
 
 
 @dataclass
@@ -25,943 +25,1477 @@ class OCRResult:
     quality_score: float
     preprocessing: str
     rotation: int = 0
-    
-    def __repr__(self):
-        return (f"OCRResult(text='{self.text}', conf={self.confidence:.1f}, "
-                f"quality={self.quality_score:.1f}, "
-                f"prep='{self.preprocessing}', rot={self.rotation}°)")
+    corrected: bool = False
+    original_text: str = ""
+    corrections_applied: List[Tuple[str, str]] = field(default_factory=list)
 
 
-class CellOCR:
+class ScheduleDictionary:
     """
-    Handles OCR operations for extracting text from table cells.
-    Uses PaddleOCR with multiple preprocessing techniques for best results.
-    Optimized for Apple Silicon (M1/M2/M3) Macs.
+    Dictionary manager with word-level correction support.
+    
+    Supports:
+    - Word-level corrections: "DeBlgn" -> "Design"
+    - Phrase-level corrections (optional, for special cases): "et al" -> "et al."
+    - Dictionary terms for validation
     """
     
-    _ocr_lock = threading.Lock()
-
-    def __init__(
-        self,
-        minimum_confidence_threshold=50.0,
-        high_confidence_threshold=90.0,
-        verbose_logging=False,
-        empty_cell_variance_threshold=100.0,
-        empty_cell_content_ratio_threshold=0.01,
-        rotation_score_boost=1.2,
-        min_text_length_for_rotation=3,
-        languages="en",
-        upscale_factor=2,
-        enable_fallback_modes=True,
-        fallback_confidence_threshold=30.0,
-    ):
-        """Initialize the CellOCR with PaddleOCR."""
-        self.minimum_confidence_threshold = minimum_confidence_threshold
-        self.high_confidence_threshold = high_confidence_threshold
-        self.verbose_logging = verbose_logging
-        self.empty_cell_variance_threshold = empty_cell_variance_threshold
-        self.empty_cell_content_ratio_threshold = empty_cell_content_ratio_threshold
-        self.rotation_score_boost = rotation_score_boost
-        self.min_text_length_for_rotation = min_text_length_for_rotation
-        self.upscale_factor = upscale_factor
-        self.enable_fallback_modes = enable_fallback_modes
-        self.fallback_confidence_threshold = fallback_confidence_threshold
+    def __init__(self, dictionary_path: Optional[str] = None, verbose: bool = False):
+        """Initialize dictionary with word-level correction support."""
+        self.logger = logging.getLogger(__name__ + ".Dictionary")
+        self.verbose = verbose
         
-        self.logger = logging.getLogger(__name__)
-        self.languages = self._parse_languages(languages)
-        self._ocr = None
-        self._valid_ocr_params = None
-
-    def _parse_languages(self, languages: str) -> str:
-        """Parse language string to PaddleOCR format."""
-        lang_map = {
-            "eng": "en",
-            "ron": "latin",
-            "fra": "fr",
-            "deu": "german",
-            "spa": "es",
-            "ita": "it",
-            "eng+ron": "latin",
+        # Default terms
+        self.default_terms = {
+            "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", 
+                    "Saturday", "Sunday", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+            "months": ["January", "February", "March", "April", "May", "June",
+                      "July", "August", "September", "October", "November", "December"],
+            "schedule_terms": ["Lecture", "Lab", "Tutorial", "Seminar", "Workshop", 
+                             "Class", "Break", "Lunch", "Exam", "Test"],
+            "time_terms": ["AM", "PM", "Morning", "Afternoon", "Evening"],
+            "locations": ["Room", "Hall", "Building", "Floor", "Lab", "Office"],
         }
         
-        if languages.lower() in lang_map:
-            return lang_map[languages.lower()]
+        # Word-level corrections: incorrect_word -> correct_word
+        self.word_corrections: Dict[str, str] = {}  # lowercase incorrect -> correct (with case)
+        self.word_corrections_by_correct: Dict[str, List[str]] = {}  # correct -> [incorrect variations]
         
-        parts = re.split(r'[+,]', languages.lower().strip())
-        mapped = [lang_map.get(p.strip(), p.strip()) for p in parts]
+        # Phrase-level corrections (optional, for special multi-word cases)
+        self.phrase_corrections: Dict[str, str] = {}  # lowercase incorrect phrase -> correct phrase
+        self.phrase_corrections_by_correct: Dict[str, List[str]] = {}
         
-        if 'latin' in mapped or 'ro' in mapped:
-            return 'latin'
+        # All valid terms for validation
+        self.all_terms: Set[str] = set()
+        self.terms_lower_map: Dict[str, str] = {}
         
-        return mapped[0] if mapped else 'en'
+        # Custom terms loaded from file
+        self.custom_terms: Dict[str, List[str]] = {}
+        self.custom_word_corrections: Dict[str, List[str]] = {}  # correct -> [variations]
+        self.custom_phrase_corrections: Dict[str, List[str]] = {}  # correct -> [variations]
+        
+        # File path
+        self.dictionary_path = dictionary_path or "schedule_dictionary.json"
+        
+        # Load and build
+        self._load_dictionary()
+        self._build_lookup()
+        
+        # Character substitutions for suggestions
+        self.char_substitutions = {
+            '0': ['O', 'o'], 'O': ['0'], 'o': ['0'],
+            '1': ['I', 'l', 'i'], 'I': ['1', 'l'], 'l': ['1', 'I', 'i'],
+            '5': ['S', 's'], 'S': ['5'], 's': ['5'],
+            '8': ['B'], 'B': ['8'],
+            'rn': ['m'], 'm': ['rn'],
+            'vv': ['w'], 'w': ['vv'],
+            'cl': ['d'], 'd': ['cl'],
+            'n': ['ri'], 'ri': ['n'],
+        }
+        
+        stats = self.get_stats()
+        self.logger.info(f"Dictionary initialized: {stats['word_corrections']} word corrections, "
+                        f"{stats['phrase_corrections']} phrase corrections, "
+                        f"{stats['total_terms']} terms")
 
-    def _get_valid_paddleocr_params(self) -> set:
-        """Get valid parameters for PaddleOCR constructor."""
-        if self._valid_ocr_params is not None:
-            return self._valid_ocr_params
+    def _load_dictionary(self):
+        """Load dictionary from JSON file."""
+        if not os.path.exists(self.dictionary_path):
+            self.logger.info(f"No dictionary at {self.dictionary_path}, using defaults")
+            return
         
         try:
-            from paddleocr import PaddleOCR
-            sig = inspect.signature(PaddleOCR.__init__)
-            self._valid_ocr_params = set(sig.parameters.keys()) - {'self'}
-            if self.verbose_logging:
-                self.logger.info(f"Valid PaddleOCR params: {self._valid_ocr_params}")
+            with open(self.dictionary_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            # Load terms
+            self.custom_terms = data.get("terms", {})
+            
+            # Load word corrections (new format)
+            self.custom_word_corrections = data.get("word_corrections", {})
+            
+            # Load phrase corrections (optional)
+            self.custom_phrase_corrections = data.get("phrase_corrections", {})
+            
+            # Backward compatibility: convert old "corrections" format
+            if "corrections" in data and not self.custom_word_corrections:
+                self.logger.info("Converting old corrections format to word-level...")
+                self._convert_old_format(data["corrections"])
+            
+            self.logger.info(f"Loaded dictionary from {self.dictionary_path}")
+            
         except Exception as e:
-            self.logger.warning(f"Could not inspect PaddleOCR params: {e}")
-            # Fallback to commonly supported params
-            self._valid_ocr_params = {'lang', 'det', 'rec', 'cls'}
+            self.logger.warning(f"Failed to load dictionary: {e}")
+
+    def _convert_old_format(self, old_corrections: Dict[str, List[str]]):
+        """Convert old phrase-based corrections to word-level where possible."""
+        for correct_phrase, variations in old_corrections.items():
+            correct_words = correct_phrase.split()
+            
+            if len(correct_words) == 1:
+                # Single word - add as word correction
+                if correct_phrase not in self.custom_word_corrections:
+                    self.custom_word_corrections[correct_phrase] = []
+                for var in variations:
+                    var_words = var.split()
+                    if len(var_words) == 1:
+                        self.custom_word_corrections[correct_phrase].append(var)
+            else:
+                # Multi-word - try to extract word-level corrections
+                for variation in variations:
+                    var_words = variation.split()
+                    if len(var_words) == len(correct_words):
+                        # Same word count - extract individual word corrections
+                        for correct_word, var_word in zip(correct_words, var_words):
+                            if correct_word.lower() != var_word.lower():
+                                if correct_word not in self.custom_word_corrections:
+                                    self.custom_word_corrections[correct_word] = []
+                                if var_word not in self.custom_word_corrections[correct_word]:
+                                    self.custom_word_corrections[correct_word].append(var_word)
+
+    def _build_lookup(self):
+        """Build lookup structures."""
+        self.word_corrections.clear()
+        self.word_corrections_by_correct.clear()
+        self.phrase_corrections.clear()
+        self.phrase_corrections_by_correct.clear()
+        self.all_terms.clear()
+        self.terms_lower_map.clear()
         
-        return self._valid_ocr_params
-
-    def _filter_ocr_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Filter parameters to only include valid ones for the installed version."""
-        valid_params = self._get_valid_paddleocr_params()
-        filtered = {}
+        # Build terms lookup
+        for category, terms in {**self.default_terms, **self.custom_terms}.items():
+            for term in terms:
+                self.all_terms.add(term)
+                self.terms_lower_map[term.lower()] = term
+                # Also add individual words from multi-word terms
+                for word in term.split():
+                    if len(word) > 1:
+                        self.all_terms.add(word)
+                        self.terms_lower_map[word.lower()] = word
         
-        for key, value in params.items():
-            if key in valid_params:
-                filtered[key] = value
-            elif self.verbose_logging:
-                self.logger.debug(f"Skipping unsupported PaddleOCR param: {key}")
+        # Build word corrections lookup
+        for correct_word, variations in self.custom_word_corrections.items():
+            self.word_corrections_by_correct[correct_word] = variations
+            # Add correct word to terms
+            self.all_terms.add(correct_word)
+            self.terms_lower_map[correct_word.lower()] = correct_word
+            
+            for variation in variations:
+                self.word_corrections[variation.lower()] = correct_word
+                if self.verbose:
+                    self.logger.debug(f"Word correction: '{variation}' -> '{correct_word}'")
         
-        return filtered
+        # Build phrase corrections lookup
+        for correct_phrase, variations in self.custom_phrase_corrections.items():
+            self.phrase_corrections_by_correct[correct_phrase] = variations
+            for variation in variations:
+                self.phrase_corrections[variation.lower()] = correct_phrase
 
-    def _get_ocr_instance(self):
-        """Get or create a PaddleOCR instance (thread-safe)."""
-        with self._ocr_lock:
-            if self._ocr is None:
-                from paddleocr import PaddleOCR
-                
-                if self.verbose_logging:
-                    self.logger.info(f"Initializing PaddleOCR with language: {self.languages}")
-                
-                # Define all parameters we'd like to use
-                desired_params = {
-                    'lang': self.languages,
-                    'use_angle_cls': True,
-                    'use_gpu': False,
-                    'show_log': self.verbose_logging,
-                    'det_limit_side_len': 1920,
-                    'det_limit_type': 'max',
-                    'det_db_thresh': 0.2,
-                    'det_db_box_thresh': 0.3,
-                    'det_db_unclip_ratio': 1.8,
-                    'drop_score': 0.3,
-                }
-                
-                # Filter to only valid params
-                valid_params = self._filter_ocr_params(desired_params)
-                
-                if self.verbose_logging:
-                    self.logger.info(f"Using PaddleOCR params: {valid_params}")
-                
-                try:
-                    self._ocr = PaddleOCR(**valid_params)
-                except TypeError as e:
-                    # If still failing, try minimal params
-                    self.logger.warning(f"PaddleOCR init failed with params, trying minimal: {e}")
-                    minimal_params = {'lang': self.languages}
-                    self._ocr = PaddleOCR(**minimal_params)
-                
-            return self._ocr
-
-    @property
-    def ocr(self):
-        """Get the main OCR instance."""
-        return self._get_ocr_instance()
-
-    def _get_valid_ocr_call_params(self) -> set:
-        """Get valid parameters for the ocr() method call."""
+    def save_dictionary(self) -> bool:
+        """Save dictionary to JSON file."""
         try:
-            sig = inspect.signature(self.ocr.ocr)
-            return set(sig.parameters.keys()) - {'self'}
-        except Exception:
-            return {'img', 'det', 'rec', 'cls'}
-
-    def _upscale_image(self, img: np.ndarray, scale: int = None) -> np.ndarray:
-        """Upscale an image by a given factor."""
-        if scale is None:
-            scale = self.upscale_factor
-        if scale <= 1:
-            return img
-        
-        new_width = int(img.shape[1] * scale)
-        new_height = int(img.shape[0] * scale)
-        return cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
-
-    def _ensure_bgr(self, img: np.ndarray) -> np.ndarray:
-        """Ensure image is in BGR format."""
-        if len(img.shape) == 2:
-            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        elif img.shape[2] == 4:
-            return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-        return img
-
-    def _ensure_black_text_on_white(self, binary_img: np.ndarray) -> np.ndarray:
-        """Ensure text is black on white background."""
-        if len(binary_img.shape) == 3:
-            gray = cv2.cvtColor(binary_img, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = binary_img
-        
-        h, w = gray.shape[:2]
-        margin_h = max(1, h // 4)
-        margin_w = max(1, w // 4)
-        
-        center = gray[margin_h:h-margin_h, margin_w:w-margin_w]
-        if center.size == 0:
-            center = gray
-        
-        if np.sum(center <= 55) > np.sum(center >= 200):
-            return cv2.bitwise_not(gray)
-        return gray
-
-    # Preprocessing methods
-    def _preprocess_none(self, img: np.ndarray) -> np.ndarray:
-        """No preprocessing."""
-        return self._ensure_bgr(img)
-
-    def _preprocess_otsu(self, img: np.ndarray) -> np.ndarray:
-        """Otsu's thresholding."""
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img.copy()
-        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-        _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        binary = self._ensure_black_text_on_white(binary)
-        return cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
-
-    def _preprocess_adaptive_gaussian(self, img: np.ndarray) -> np.ndarray:
-        """Adaptive Gaussian thresholding."""
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img.copy()
-        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-        binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-        binary = self._ensure_black_text_on_white(binary)
-        return cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
-
-    def _preprocess_adaptive_mean(self, img: np.ndarray) -> np.ndarray:
-        """Adaptive mean thresholding."""
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img.copy()
-        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-        binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 11, 2)
-        binary = self._ensure_black_text_on_white(binary)
-        return cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
-
-    def _preprocess_contrast_enhanced(self, img: np.ndarray) -> np.ndarray:
-        """CLAHE contrast enhancement."""
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img.copy()
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
-        return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-
-    def _preprocess_morphological(self, img: np.ndarray) -> np.ndarray:
-        """Morphological operations."""
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img.copy()
-        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-        _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        binary = self._ensure_black_text_on_white(binary)
-        kernel = np.ones((2, 2), np.uint8)
-        opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-        return cv2.cvtColor(opened, cv2.COLOR_GRAY2BGR)
-
-    def _preprocess_sharpened(self, img: np.ndarray) -> np.ndarray:
-        """Sharpening."""
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img.copy()
-        kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
-        sharpened = cv2.filter2D(gray, -1, kernel)
-        _, binary = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        binary = self._ensure_black_text_on_white(binary)
-        return cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
-
-    def _preprocess_denoise(self, img: np.ndarray) -> np.ndarray:
-        """Denoising."""
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img.copy()
-        denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
-        _, binary = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        binary = self._ensure_black_text_on_white(binary)
-        return cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
-
-    def _get_preprocessing_methods(self, is_fallback: bool = False) -> List[Tuple[str, callable]]:
-        """Get list of preprocessing methods."""
-        primary = [
-            ("none", self._preprocess_none),
-            ("contrast_enhanced", self._preprocess_contrast_enhanced),
-            ("otsu", self._preprocess_otsu),
-        ]
-        fallback = [
-            ("adaptive_gaussian", self._preprocess_adaptive_gaussian),
-            ("adaptive_mean", self._preprocess_adaptive_mean),
-            ("morphological", self._preprocess_morphological),
-            ("sharpened", self._preprocess_sharpened),
-            ("denoise", self._preprocess_denoise),
-        ]
-        return primary + fallback if is_fallback else primary
-
-    def _is_cell_likely_empty(self, gray_img: np.ndarray, cell_id: str = "") -> bool:
-        """Check if a cell is likely empty."""
-        if len(gray_img.shape) == 3:
-            gray_img = cv2.cvtColor(gray_img, cv2.COLOR_BGR2GRAY)
-        
-        variance = np.var(gray_img)
-        if variance < self.empty_cell_variance_threshold:
-            if self.verbose_logging:
-                self.logger.debug(f"{cell_id}: Empty (variance: {variance:.2f})")
+            data = {
+                "terms": self.custom_terms,
+                "word_corrections": self.custom_word_corrections,
+                "phrase_corrections": self.custom_phrase_corrections
+            }
+            
+            with open(self.dictionary_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            
+            self.logger.info(f"Saved dictionary to {self.dictionary_path}")
             return True
+        except Exception as e:
+            self.logger.error(f"Failed to save: {e}")
+            return False
+
+    # =========================================================================
+    # Word-Level Correction Methods
+    # =========================================================================
+    
+    def add_word_correction(self, incorrect: str, correct: str) -> bool:
+        """
+        Add a word-level correction.
         
-        _, binary = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        kernel = np.ones((3, 3), np.uint8)
-        binary_cleaned = cv2.erode(binary, kernel, iterations=1)
-        content_ratio = np.sum(binary_cleaned == 255) / binary_cleaned.size
+        Args:
+            incorrect: The incorrect OCR word (e.g., "DeBlgn")
+            correct: The correct word (e.g., "Design")
+            
+        Returns:
+            True if added successfully
+            
+        Example:
+            dictionary.add_word_correction("DeBlgn", "Design")
+            dictionary.add_word_correction("Learnlng", "Learning")
+        """
+        if not incorrect or not correct:
+            return False
         
-        if content_ratio < self.empty_cell_content_ratio_threshold:
-            if self.verbose_logging:
-                self.logger.debug(f"{cell_id}: Empty (content ratio: {content_ratio:.4f})")
-            return True
+        incorrect = incorrect.strip()
+        correct = correct.strip()
         
-        edges = cv2.Canny(gray_img, 50, 150)
-        edge_ratio = np.sum(edges > 0) / edges.size
+        # Don't add if same
+        if incorrect.lower() == correct.lower():
+            return False
         
-        if edge_ratio < 0.005:
-            if self.verbose_logging:
-                self.logger.debug(f"{cell_id}: Empty (edge ratio: {edge_ratio:.4f})")
+        # Don't add multi-word as word correction
+        if ' ' in incorrect or ' ' in correct:
+            self.logger.warning(f"Use add_phrase_correction for multi-word: '{incorrect}' -> '{correct}'")
+            return False
+        
+        # Add to custom corrections
+        if correct not in self.custom_word_corrections:
+            self.custom_word_corrections[correct] = []
+        
+        if incorrect not in self.custom_word_corrections[correct]:
+            self.custom_word_corrections[correct].append(incorrect)
+            
+            # Update lookup
+            self.word_corrections[incorrect.lower()] = correct
+            self.word_corrections_by_correct[correct] = self.custom_word_corrections[correct]
+            
+            # Add correct word to terms
+            self.all_terms.add(correct)
+            self.terms_lower_map[correct.lower()] = correct
+            
+            self.logger.info(f"Added word correction: '{incorrect}' -> '{correct}'")
             return True
         
         return False
 
-    def _calculate_text_quality_score(
-        self, text: str, confidence: float, 
-        is_rotated: bool = False, expects_rotation: bool = False
-    ) -> float:
-        """Calculate quality score (confidence in 0-100)."""
-        if not text:
-            return 0
+    def add_word_corrections_batch(self, correct_word: str, variations: List[str]) -> int:
+        """
+        Add multiple incorrect variations for a word.
         
-        score = confidence
-        text_length = len(text.strip())
-        
-        if text_length <= 2 and confidence < 80:
-            score *= 0.5
-        elif text_length >= 3:
-            score *= (1 + min(0.3, text_length / 20))
-        
-        alphanumeric = sum(1 for c in text if c.isalnum())
-        total = len(text.replace(" ", ""))
-        
-        if total > 0:
-            ratio = alphanumeric / total
-            if ratio < 0.3:
-                score *= 0.6
-            elif ratio > 0.7:
-                score *= 1.1
-        
-        # Pattern boosts
-        if re.search(r'\d{1,2}[/-]\d{1,2}', text):
-            score *= 1.2
-        if re.search(r'\b[A-Z]{2,4}\s*\d{3,4}\b', text):
-            score *= 1.3
-        if re.search(r'\b\d{1,2}:\d{2}\b', text):
-            score *= 1.2
-        
-        if expects_rotation and is_rotated and text_length >= self.min_text_length_for_rotation:
-            score *= self.rotation_score_boost
-        
-        if re.match(r'^(.)\1+$', text.strip()):
-            score *= 0.3
-        
-        return score
+        Args:
+            correct_word: The correct word
+            variations: List of incorrect variations
+            
+        Returns:
+            Number of corrections added
+            
+        Example:
+            dictionary.add_word_corrections_batch("Design", [
+                "DeBlgn", "Deslgn", "Des1gn", "Desiqn"
+            ])
+        """
+        added = 0
+        for variation in variations:
+            if self.add_word_correction(variation, correct_word):
+                added += 1
+        return added
 
-    def _is_text_valid(self, text: str, confidence: float) -> bool:
-        """Check if text is valid."""
+    def get_word_correction(self, word: str) -> Optional[str]:
+        """
+        Get correction for a single word (exact match).
+        
+        Args:
+            word: The word to look up
+            
+        Returns:
+            Corrected word or None
+        """
+        return self.word_corrections.get(word.lower())
+
+    def find_similar_word_correction(self, word: str, threshold: float = 0.80) -> Optional[Tuple[str, float]]:
+        """
+        Find similar word correction using fuzzy matching.
+        
+        Args:
+            word: The word to match
+            threshold: Minimum similarity (0-1)
+            
+        Returns:
+            Tuple of (corrected_word, similarity) or None
+        """
+        if not word or len(word) < 2:
+            return None
+        
+        word_lower = word.lower()
+        
+        # Exact match first
+        if word_lower in self.word_corrections:
+            return (self.word_corrections[word_lower], 1.0)
+        
+        # Fuzzy match against all incorrect variations
+        best_match = None
+        best_ratio = threshold
+        
+        for incorrect_lower, correct in self.word_corrections.items():
+            # Skip if length difference too large
+            if abs(len(word) - len(incorrect_lower)) > max(2, len(word) * 0.3):
+                continue
+            
+            ratio = SequenceMatcher(None, word_lower, incorrect_lower).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_match = correct
+        
+        if best_match:
+            return (best_match, best_ratio)
+        
+        return None
+
+    # =========================================================================
+    # Phrase-Level Correction Methods (for special cases)
+    # =========================================================================
+    
+    def add_phrase_correction(self, incorrect: str, correct: str) -> bool:
+        """
+        Add a phrase-level correction (for special multi-word cases).
+        
+        Use this sparingly - prefer word-level corrections.
+        
+        Args:
+            incorrect: The incorrect phrase
+            correct: The correct phrase
+        """
+        if not incorrect or not correct:
+            return False
+        
+        incorrect = incorrect.strip()
+        correct = correct.strip()
+        
+        if incorrect.lower() == correct.lower():
+            return False
+        
+        if correct not in self.custom_phrase_corrections:
+            self.custom_phrase_corrections[correct] = []
+        
+        if incorrect not in self.custom_phrase_corrections[correct]:
+            self.custom_phrase_corrections[correct].append(incorrect)
+            self.phrase_corrections[incorrect.lower()] = correct
+            self.phrase_corrections_by_correct[correct] = self.custom_phrase_corrections[correct]
+            
+            self.logger.info(f"Added phrase correction: '{incorrect}' -> '{correct}'")
+            return True
+        
+        return False
+
+    def get_phrase_correction(self, phrase: str) -> Optional[str]:
+        """Get correction for a phrase (exact match)."""
+        return self.phrase_corrections.get(phrase.lower())
+
+    # =========================================================================
+    # Term Validation Methods
+    # =========================================================================
+    
+    def add_term(self, term: str, category: str = "custom"):
+        """Add a term to the dictionary."""
+        if category not in self.custom_terms:
+            self.custom_terms[category] = []
+        
+        if term not in self.custom_terms[category]:
+            self.custom_terms[category].append(term)
+            self.all_terms.add(term)
+            self.terms_lower_map[term.lower()] = term
+
+    def is_valid_term(self, text: str) -> bool:
+        """Check if text matches a dictionary term."""
+        return text.lower() in self.terms_lower_map
+
+    def is_valid_word(self, word: str) -> bool:
+        """Check if a single word is valid/known."""
+        word_lower = word.lower()
+        # Valid if it's a term or a correct word in corrections
+        return (word_lower in self.terms_lower_map or 
+                any(w.lower() == word_lower for w in self.word_corrections_by_correct.keys()))
+
+    def find_similar_term(self, text: str, threshold: float = 0.80) -> Optional[Tuple[str, float]]:
+        """Find similar term using fuzzy matching."""
+        if not text or len(text) < 2:
+            return None
+        
+        text_lower = text.lower()
+        
+        if text_lower in self.terms_lower_map:
+            return (self.terms_lower_map[text_lower], 1.0)
+        
+        best_match = None
+        best_ratio = threshold
+        
+        for term_lower, term in self.terms_lower_map.items():
+            if abs(len(text) - len(term)) > 3:
+                continue
+            ratio = SequenceMatcher(None, text_lower, term_lower).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_match = term
+        
+        return (best_match, best_ratio) if best_match else None
+
+    # =========================================================================
+    # Utility Methods
+    # =========================================================================
+    
+    def remove_word_correction(self, incorrect: str) -> bool:
+        """Remove a word correction."""
+        incorrect_lower = incorrect.lower()
+        
+        if incorrect_lower in self.word_corrections:
+            correct = self.word_corrections[incorrect_lower]
+            del self.word_corrections[incorrect_lower]
+            
+            if correct in self.custom_word_corrections:
+                self.custom_word_corrections[correct] = [
+                    v for v in self.custom_word_corrections[correct]
+                    if v.lower() != incorrect_lower
+                ]
+                if not self.custom_word_corrections[correct]:
+                    del self.custom_word_corrections[correct]
+            
+            return True
+        return False
+
+    def get_all_word_corrections(self) -> Dict[str, List[str]]:
+        """Get all word corrections grouped by correct word."""
+        return self.custom_word_corrections.copy()
+
+    def get_corrections_for_word(self, correct_word: str) -> List[str]:
+        """Get all registered variations for a correct word."""
+        return self.custom_word_corrections.get(correct_word, [])
+
+    def suggest_word_variations(self, word: str) -> List[str]:
+        """Suggest possible OCR variations of a word."""
+        suggestions = set()
+        
+        for i, char in enumerate(word):
+            if char in self.char_substitutions:
+                for replacement in self.char_substitutions[char]:
+                    suggestions.add(word[:i] + replacement + word[i+1:])
+        
+        for pattern, replacements in self.char_substitutions.items():
+            if len(pattern) > 1 and pattern in word:
+                for replacement in replacements:
+                    suggestions.add(word.replace(pattern, replacement))
+        
+        # Filter existing corrections
+        suggestions = {s for s in suggestions 
+                      if s.lower() not in self.word_corrections and s.lower() != word.lower()}
+        
+        return sorted(suggestions)[:10]
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get dictionary statistics."""
+        return {
+            "total_terms": len(self.all_terms),
+            "word_corrections": len(self.word_corrections),
+            "phrase_corrections": len(self.phrase_corrections),
+            "unique_correct_words": len(self.word_corrections_by_correct),
+            "categories": len(self.custom_terms)
+        }
+
+
+class WordLevelCorrector:
+    """
+    Corrects OCR text word by word.
+    """
+    
+    def __init__(self, dictionary: ScheduleDictionary, verbose: bool = False):
+        """Initialize corrector."""
+        self.dictionary = dictionary
+        self.verbose = verbose
+        self.logger = logging.getLogger(__name__ + ".Corrector")
+        
+        # Pattern to split text into words while preserving punctuation
+        self.word_pattern = re.compile(r'(\s+|[^\w\s]+)')
+        
+        # Patterns for validation
+        self.time_pattern = re.compile(r'^([0-9]{1,2}):([0-9]{2})$')
+        self.number_pattern = re.compile(r'^[0-9]+$')
+        
+        # Track corrections and unrecognized words
+        self.unrecognized_words: Dict[str, int] = defaultdict(int)
+        
+        # Statistics
+        self.stats = {
+            'texts_processed': 0,
+            'words_processed': 0,
+            'words_corrected': 0,
+            'exact_corrections': 0,
+            'fuzzy_corrections': 0,
+            'phrases_corrected': 0,
+            'unrecognized': 0
+        }
+
+    def correct_text(self, text: str, confidence: float = 50.0) -> Tuple[str, float, bool, List[Tuple[str, str]]]:
+        """
+        Correct OCR text word by word.
+        
+        Args:
+            text: The OCR text to correct
+            confidence: OCR confidence (0-100)
+            
+        Returns:
+            Tuple of (corrected_text, new_confidence, was_corrected, list of (original, corrected) pairs)
+        """
+        self.stats['texts_processed'] += 1
+        
         if not text or not text.strip():
-            return False
+            return text, confidence, False, []
         
-        stripped = text.strip()
+        original_text = text
+        corrections_made = []
         
-        if len(stripped) <= 1 and confidence < 80:
-            return False
+        # Step 1: Check for phrase-level corrections first (exact match)
+        phrase_correction = self.dictionary.get_phrase_correction(text)
+        if phrase_correction:
+            self.stats['phrases_corrected'] += 1
+            if self.verbose:
+                self.logger.debug(f"Phrase correction: '{text}' -> '{phrase_correction}'")
+            return phrase_correction, min(confidence + 15, 98), True, [(text, phrase_correction)]
         
-        alphanumeric = sum(1 for c in stripped if c.isalnum())
-        if alphanumeric == 0:
-            return False
+        # Step 2: Split into tokens (words and separators)
+        tokens = self._tokenize(text)
+        corrected_tokens = []
         
-        if re.match(r'^(.)\1{3,}$', stripped):
-            return False
+        for token, is_word in tokens:
+            if not is_word:
+                # Separator (space, punctuation) - keep as is
+                corrected_tokens.append(token)
+                continue
+            
+            self.stats['words_processed'] += 1
+            
+            # Try to correct the word
+            corrected_word, correction_type = self._correct_word(token, confidence)
+            
+            if corrected_word != token:
+                corrections_made.append((token, corrected_word))
+                self.stats['words_corrected'] += 1
+                
+                if correction_type == 'exact':
+                    self.stats['exact_corrections'] += 1
+                elif correction_type == 'fuzzy':
+                    self.stats['fuzzy_corrections'] += 1
+                
+                if self.verbose:
+                    self.logger.debug(f"Word correction ({correction_type}): '{token}' -> '{corrected_word}'")
+            
+            corrected_tokens.append(corrected_word)
         
-        return True
+        # Reconstruct text
+        corrected_text = ''.join(corrected_tokens)
+        
+        # Calculate new confidence
+        was_corrected = len(corrections_made) > 0
+        if was_corrected:
+            # Boost confidence based on number of corrections
+            conf_boost = min(len(corrections_made) * 5, 15)
+            new_confidence = min(confidence + conf_boost, 95)
+        else:
+            new_confidence = confidence
+        
+        return corrected_text, new_confidence, was_corrected, corrections_made
 
-    def _should_try_rotation(self, cell: dict) -> bool:
-        """Check if rotation should be tried."""
-        return cell.get("rowspan", 1) > 1
+    def _tokenize(self, text: str) -> List[Tuple[str, bool]]:
+        """
+        Split text into tokens, preserving separators.
+        
+        Returns:
+            List of (token, is_word) tuples
+        """
+        tokens = []
+        parts = self.word_pattern.split(text)
+        
+        for part in parts:
+            if not part:
+                continue
+            
+            # Check if it's a word (alphanumeric) or separator
+            is_word = bool(re.match(r'^\w+$', part))
+            tokens.append((part, is_word))
+        
+        return tokens
 
-    def _rotate_image(self, img: np.ndarray, angle: int) -> np.ndarray:
-        """Rotate image by angle."""
-        if angle == 90:
-            return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
-        elif angle == 180:
-            return cv2.rotate(img, cv2.ROTATE_180)
-        elif angle == 270:
-            return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    def _correct_word(self, word: str, confidence: float) -> Tuple[str, str]:
+        """
+        Correct a single word.
+        
+        Returns:
+            Tuple of (corrected_word, correction_type)
+            correction_type: 'exact', 'fuzzy', 'none'
+        """
+        # Skip short words
+        if len(word) < 2:
+            return word, 'none'
+        
+        # Skip numbers and times
+        if self.number_pattern.match(word) or self.time_pattern.match(word):
+            return word, 'none'
+        
+        # Step 1: Exact word correction
+        exact_correction = self.dictionary.get_word_correction(word)
+        if exact_correction:
+            # Preserve original case pattern if possible
+            return self._apply_case(word, exact_correction), 'exact'
+        
+        # Step 2: Check if word is already valid
+        if self.dictionary.is_valid_word(word):
+            return word, 'none'
+        
+        # Step 3: Fuzzy word correction (for lower confidence)
+        if confidence < 85:
+            threshold = 0.75 if confidence < 60 else 0.82
+            fuzzy_result = self.dictionary.find_similar_word_correction(word, threshold)
+            if fuzzy_result:
+                return self._apply_case(word, fuzzy_result[0]), 'fuzzy'
+        
+        # Step 4: Fuzzy term matching (for lower confidence)
+        if confidence < 80:
+            fuzzy_term = self.dictionary.find_similar_term(word, threshold=0.80)
+            if fuzzy_term:
+                return self._apply_case(word, fuzzy_term[0]), 'fuzzy'
+        
+        # Track unrecognized word
+        if confidence < 75 and len(word) > 2:
+            self._track_unrecognized(word)
+        
+        return word, 'none'
+
+    def _apply_case(self, original: str, corrected: str) -> str:
+        """
+        Apply the case pattern from original to corrected.
+        
+        Examples:
+            original="DESIGN", corrected="Design" -> "DESIGN"
+            original="design", corrected="Design" -> "design"
+            original="Design", corrected="design" -> "Design"
+        """
+        if not original or not corrected:
+            return corrected
+        
+        # All uppercase
+        if original.isupper():
+            return corrected.upper()
+        
+        # All lowercase
+        if original.islower():
+            return corrected.lower()
+        
+        # Title case (first letter uppercase)
+        if original[0].isupper() and (len(original) == 1 or original[1:].islower()):
+            return corrected.capitalize()
+        
+        # Keep corrected word's case (it's the "proper" form)
+        return corrected
+
+    def _track_unrecognized(self, word: str):
+        """Track unrecognized words for review."""
+        normalized = word.lower()
+        self.unrecognized_words[normalized] += 1
+        self.stats['unrecognized'] += 1
+
+    def get_unrecognized_words(self, min_occurrences: int = 1) -> List[Tuple[str, int]]:
+        """
+        Get unrecognized words sorted by frequency.
+        
+        Returns:
+            List of (word, count) tuples
+        """
+        filtered = [(w, c) for w, c in self.unrecognized_words.items() if c >= min_occurrences]
+        return sorted(filtered, key=lambda x: x[1], reverse=True)
+
+    def clear_unrecognized(self):
+        """Clear unrecognized words tracking."""
+        self.unrecognized_words.clear()
+
+    def get_stats(self) -> dict:
+        """Get correction statistics."""
+        return self.stats.copy()
+
+    def reset_stats(self):
+        """Reset statistics."""
+        self.stats = {
+            'texts_processed': 0,
+            'words_processed': 0,
+            'words_corrected': 0,
+            'exact_corrections': 0,
+            'fuzzy_corrections': 0,
+            'phrases_corrected': 0,
+            'unrecognized': 0
+        }
+
+
+class CellOCR:
+    """
+    Fast OCR for table cells with word-level correction.
+    """
+    
+    _ocr_instance = None
+    _ocr_init_lock = threading.Lock()
+    
+    MIN_OCR_SIZE = 32
+    MAX_OCR_SIZE = 2000
+    OPTIMAL_HEIGHT = 48
+    
+    def __init__(
+        self,
+        minimum_confidence_threshold: float = 40.0,
+        high_confidence_threshold: float = 80.0,
+        verbose_logging: bool = False,
+        empty_cell_variance_threshold: float = 50.0,
+        languages: str = "en",
+        enable_rotation: bool = True,
+        max_retries: int = 2,
+        dictionary_path: Optional[str] = None,
+        enable_validation: bool = True,
+    ):
+        """Initialize CellOCR with word-level correction."""
+        self.min_conf = minimum_confidence_threshold
+        self.high_conf = high_confidence_threshold
+        self.verbose = verbose_logging
+        self.empty_variance = empty_cell_variance_threshold
+        self.enable_rotation = enable_rotation
+        self.max_retries = max_retries
+        self.enable_validation = enable_validation
+        
+        # Setup logger
+        self.logger = logging.getLogger(__name__)
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        if not self.logger.handlers:
+            self.logger.addHandler(handler)
+        self.logger.setLevel(logging.DEBUG if verbose_logging else logging.INFO)
+        
+        self.lang = self._parse_lang(languages)
+        
+        # Initialize dictionary and corrector
+        if self.enable_validation:
+            self.dictionary = ScheduleDictionary(dictionary_path, verbose=verbose_logging)
+            self.corrector = WordLevelCorrector(self.dictionary, verbose=verbose_logging)
+            self.logger.info("Word-level correction enabled")
+        else:
+            self.dictionary = None
+            self.corrector = None
+        
+        # Stats
+        self.stats = {
+            'cells': 0, 'ocr_calls': 0, 'empty': 0,
+            'success': 0, 'time': 0, 'corrected': 0
+        }
+        
+        self.logger.info(f"CellOCR initialized (lang={self.lang}, validation={enable_validation})")
+
+    def _parse_lang(self, lang: str) -> str:
+        """Parse language to PaddleOCR format."""
+        mapping = {
+            "eng": "en", "en": "en", "ron": "latin", "latin": "latin",
+            "fra": "fr", "fr": "fr", "deu": "german", "german": "german",
+            "ch": "ch", "chinese": "ch",
+        }
+        return mapping.get(lang.lower().split('+')[0].strip(), "en")
+
+    def _get_ocr(self):
+        """Get or create OCR instance."""
+        if CellOCR._ocr_instance is not None:
+            return CellOCR._ocr_instance
+        
+        with CellOCR._ocr_init_lock:
+            if CellOCR._ocr_instance is not None:
+                return CellOCR._ocr_instance
+            
+            self.logger.info("Loading PaddleOCR...")
+            start = time.time()
+            
+            from paddleocr import PaddleOCR
+            
+            try:
+                CellOCR._ocr_instance = PaddleOCR(lang=self.lang, show_log=self.verbose)
+            except Exception as e:
+                self.logger.warning(f"Init failed: {e}")
+                CellOCR._ocr_instance = PaddleOCR(lang=self.lang)
+            
+            self.logger.info(f"PaddleOCR loaded in {time.time()-start:.1f}s")
+        
+        return CellOCR._ocr_instance
+
+    @property
+    def ocr(self):
+        return self._get_ocr()
+
+    def _prepare_image_for_ocr(self, img: np.ndarray) -> np.ndarray:
+        """Prepare image for OCR."""
+        if len(img.shape) == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        elif len(img.shape) == 3 and img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        
+        h, w = img.shape[:2]
+        scale = 1.0
+        
+        if h < self.MIN_OCR_SIZE or w < self.MIN_OCR_SIZE:
+            scale = max(self.MIN_OCR_SIZE / min(h, w), 1.0)
+            if h < self.OPTIMAL_HEIGHT:
+                scale = max(scale, self.OPTIMAL_HEIGHT / h)
+        
+        scale = min(scale, 4.0)
+        if max(h, w) * scale > self.MAX_OCR_SIZE:
+            scale = self.MAX_OCR_SIZE / max(h, w)
+        
+        if abs(scale - 1.0) > 0.01:
+            new_w, new_h = max(int(w * scale), 1), max(int(h * scale), 1)
+            interp = cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA
+            img = cv2.resize(img, (new_w, new_h), interpolation=interp)
+        
+        if img.dtype != np.uint8:
+            img = img.astype(np.uint8)
+        if not img.flags['C_CONTIGUOUS']:
+            img = np.ascontiguousarray(img)
+        
         return img
 
-    def _parse_ocr_result(self, result) -> List[Tuple[str, float]]:
-        """
-        Parse PaddleOCR result into list of (text, confidence) tuples.
-        Handles various result formats from different PaddleOCR versions.
-        """
+    def _is_empty(self, img: np.ndarray) -> bool:
+        """Check if cell is empty."""
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+        return np.var(gray) < self.empty_variance
+
+    def _parse_paddle_result(self, result) -> List[Tuple[str, float]]:
+        """Parse PaddleOCR result."""
         parsed = []
         
         if result is None:
             return parsed
         
-        if not isinstance(result, list):
+        if isinstance(result, dict):
+            if 'res' in result:
+                result = result['res']
+            elif 'texts' in result and 'scores' in result:
+                for t, s in zip(result['texts'], result['scores']):
+                    if t:
+                        parsed.append((str(t), float(s)))
+                return parsed
+        
+        if not isinstance(result, list) or len(result) == 0:
             return parsed
         
-        # Handle empty result
-        if len(result) == 0:
+        first = result[0]
+        if first is None:
             return parsed
         
-        # PaddleOCR can return different structures:
-        # 1. [[line1, line2, ...]] - most common
-        # 2. [line1, line2, ...] - sometimes
-        # 3. [[[box], (text, conf)], ...] - direct format
+        if isinstance(first, dict):
+            texts = first.get('texts', first.get('rec_texts', []))
+            scores = first.get('scores', first.get('rec_scores', []))
+            for t, s in zip(texts, scores):
+                if t:
+                    parsed.append((str(t), float(s)))
+            return parsed
         
-        def extract_from_line(line):
-            """Extract text and confidence from a single line result."""
-            if line is None:
+        def extract(item):
+            if not item or not isinstance(item, (list, tuple)) or len(item) < 2:
                 return None
-            
-            if not isinstance(line, (list, tuple)):
-                return None
-            
-            if len(line) < 2:
-                return None
-            
-            # line is typically [bbox, (text, confidence)]
-            text_conf = line[-1]  # Last element should be text/conf
-            
-            if text_conf is None:
-                return None
-            
-            if isinstance(text_conf, (list, tuple)) and len(text_conf) >= 2:
-                text = str(text_conf[0]).strip()
+            last = item[-1]
+            if isinstance(last, (list, tuple)) and len(last) >= 2:
                 try:
-                    conf = float(text_conf[1])
-                    if text:
-                        return (text, conf)
-                except (ValueError, TypeError):
+                    t, c = str(last[0]).strip(), float(last[1])
+                    if t and 0 <= c <= 1:
+                        return (t, c)
+                except:
                     pass
-            
             return None
         
-        # Try to parse as [[line1, line2, ...]]
-        first_elem = result[0]
+        if isinstance(first, list) and first:
+            for det in first:
+                e = extract(det)
+                if e:
+                    parsed.append(e)
         
-        if first_elem is None:
-            return parsed
-        
-        if isinstance(first_elem, list) and len(first_elem) > 0:
-            # Check if first_elem[0] is a line or another list
-            if first_elem[0] is None:
-                return parsed
-            
-            # If first_elem[0] is a list of points (bbox), then first_elem is a line
-            if (isinstance(first_elem[0], (list, tuple)) and 
-                len(first_elem[0]) > 0 and
-                isinstance(first_elem[0][0], (int, float, list, tuple))):
-                
-                # Check if it's bbox format [[x,y], [x,y], ...] or line format
-                if (isinstance(first_elem[0][0], (list, tuple)) or 
-                    (isinstance(first_elem[0][0], (int, float)) and len(first_elem) == 2)):
-                    # This looks like a single line, result is [line1, line2, ...]
-                    for line in result:
-                        extracted = extract_from_line(line)
-                        if extracted:
-                            parsed.append(extracted)
-                else:
-                    # first_elem is [line1, line2, ...], result is [[lines]]
-                    for line in first_elem:
-                        extracted = extract_from_line(line)
-                        if extracted:
-                            parsed.append(extracted)
-            else:
-                # first_elem contains lines
-                for line in first_elem:
-                    extracted = extract_from_line(line)
-                    if extracted:
-                        parsed.append(extracted)
-        
-        # If nothing parsed, try iterating result directly
         if not parsed:
             for item in result:
-                if item is None:
-                    continue
                 if isinstance(item, list):
-                    for line in item:
-                        extracted = extract_from_line(line)
-                        if extracted:
-                            parsed.append(extracted)
+                    e = extract(item)
+                    if e:
+                        parsed.append(e)
         
         return parsed
 
-    def _run_paddleocr(
-        self, img: np.ndarray, preprocessing_name: str, preprocess_func: callable
-    ) -> Tuple[str, float]:
-        """
-        Run PaddleOCR with specific preprocessing.
-        Returns (text, confidence) where confidence is 0-100.
-        """
+    def _run_ocr(self, img: np.ndarray) -> Tuple[str, float]:
+        """Run OCR on image."""
+        self.stats['ocr_calls'] += 1
+        
         try:
-            # Apply preprocessing
-            preprocessed = preprocess_func(img)
+            prepared = self._prepare_image_for_ocr(img)
             
-            # Ensure correct format
-            if preprocessed.dtype != np.uint8:
-                preprocessed = preprocessed.astype(np.uint8)
-            
-            if not preprocessed.flags['C_CONTIGUOUS']:
-                preprocessed = np.ascontiguousarray(preprocessed)
-            
-            if self.verbose_logging:
-                self.logger.debug(
-                    f"OCR with {preprocessing_name}, shape: {preprocessed.shape}, "
-                    f"dtype: {preprocessed.dtype}"
-                )
-            
-            # Try calling OCR with different parameter combinations
-            result = None
-            
-            # Get valid parameters for the ocr() method
-            valid_call_params = self._get_valid_ocr_call_params()
-            
-            # Try with cls parameter if supported
             try:
-                if 'cls' in valid_call_params:
-                    result = self.ocr.ocr(preprocessed, cls=True)
-                else:
-                    result = self.ocr.ocr(preprocessed)
+                result = self.ocr.ocr(prepared)
             except TypeError:
-                # Fallback to no extra params
-                result = self.ocr.ocr(preprocessed)
+                try:
+                    result = self.ocr.ocr(prepared, det=True, rec=True, cls=False)
+                except:
+                    return "", 0.0
             
-            if self.verbose_logging:
-                self.logger.debug(f"Raw result type: {type(result)}, result: {result}")
-            
-            # Parse result
-            parsed = self._parse_ocr_result(result)
-            
-            if self.verbose_logging:
-                self.logger.debug(f"Parsed: {parsed}")
-            
+            parsed = self._parse_paddle_result(result)
             if not parsed:
                 return "", 0.0
             
-            # Combine texts
             texts = [t for t, c in parsed]
-            confidences = [c for t, c in parsed]
-            
+            confs = [c for t, c in parsed]
             combined = " ".join(texts)
             
-            # Weighted average
-            weights = [len(t) for t in texts]
-            total_weight = sum(weights)
-            if total_weight > 0:
-                avg_conf = sum(c * w for c, w in zip(confidences, weights)) / total_weight
-            else:
-                avg_conf = sum(confidences) / len(confidences)
+            total_len = sum(len(t) for t in texts)
+            avg_conf = sum(c * len(t) for c, t in zip(confs, texts)) / total_len if total_len else 0
             
-            # Convert to 0-100 scale
-            avg_conf_100 = avg_conf * 100
-            
-            if self.verbose_logging:
-                self.logger.debug(f"Result: '{combined}' (conf: {avg_conf_100:.1f})")
-            
-            return combined, avg_conf_100
+            return combined, avg_conf * 100
             
         except Exception as e:
-            if self.verbose_logging:
-                self.logger.error(f"OCR failed ({preprocessing_name}): {e}", exc_info=True)
+            self.logger.error(f"OCR error: {e}")
             return "", 0.0
 
-    def _run_paddleocr_with_file(
-        self, img: np.ndarray, preprocessing_name: str, preprocess_func: callable
-    ) -> Tuple[str, float]:
-        """
-        Run PaddleOCR by saving to temp file first.
-        Fallback method if numpy array doesn't work.
-        """
-        try:
-            preprocessed = preprocess_func(img)
-            
-            if preprocessed.dtype != np.uint8:
-                preprocessed = preprocessed.astype(np.uint8)
-            
-            # Save to temp file
-            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
-                temp_path = f.name
-            
-            cv2.imwrite(temp_path, preprocessed)
-            
-            try:
-                # Get valid parameters
-                valid_call_params = self._get_valid_ocr_call_params()
-                
-                try:
-                    if 'cls' in valid_call_params:
-                        result = self.ocr.ocr(temp_path, cls=True)
-                    else:
-                        result = self.ocr.ocr(temp_path)
-                except TypeError:
-                    result = self.ocr.ocr(temp_path)
-                
-                if self.verbose_logging:
-                    self.logger.debug(f"File-based result: {result}")
-                
-                parsed = self._parse_ocr_result(result)
-                
-                if not parsed:
-                    return "", 0.0
-                
-                texts = [t for t, c in parsed]
-                confidences = [c for t, c in parsed]
-                combined = " ".join(texts)
-                
-                weights = [len(t) for t in texts]
-                total_weight = sum(weights)
-                avg_conf = sum(c * w for c, w in zip(confidences, weights)) / total_weight if total_weight > 0 else 0
-                
-                return combined, avg_conf * 100
-                
-            finally:
-                if os.path.exists(temp_path):
-                    os.unlink(temp_path)
-                
-        except Exception as e:
-            if self.verbose_logging:
-                self.logger.error(f"File-based OCR failed: {e}", exc_info=True)
-            return "", 0.0
-
-    def _try_all_ocr_combinations(
-        self, img: np.ndarray, cell_id: str = "",
-        expects_rotation: bool = False, is_fallback: bool = False, rotation: int = 0
-    ) -> List[OCRResult]:
-        """Try multiple OCR configurations."""
-        results = []
-        preprocessing_methods = self._get_preprocessing_methods(is_fallback)
-        
-        # Upscale
-        upscaled = self._upscale_image(img)
-        
-        for prep_name, prep_func in preprocessing_methods:
-            # Try numpy array first
-            text, confidence = self._run_paddleocr(upscaled, prep_name, prep_func)
-            
-            # If no result, try with file
-            if not text:
-                text, confidence = self._run_paddleocr_with_file(upscaled, prep_name, prep_func)
-            
-            if text:
-                quality = self._calculate_text_quality_score(
-                    text, confidence, rotation != 0, expects_rotation
-                )
-                result = OCRResult(
-                    text=text, confidence=confidence,
-                    quality_score=quality, preprocessing=prep_name, rotation=rotation
-                )
-                results.append(result)
-                
-                if self.verbose_logging:
-                    self.logger.debug(f"{cell_id}: {result}")
-                
-                if quality >= self.high_confidence_threshold and self._is_text_valid(text, confidence):
-                    return results
-        
-        return results
-
-    def _try_ocr_comprehensive(
-        self, img: np.ndarray, cell_id: str = "", expects_rotation: bool = False
-    ) -> Tuple[str, float, int]:
-        """Comprehensive OCR with multiple strategies."""
-        all_results: List[OCRResult] = []
-        
+    def _preprocess(self, img: np.ndarray, method: int = 0) -> np.ndarray:
+        """Apply preprocessing."""
         if len(img.shape) == 2:
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         
-        rotations = [0]
-        if expects_rotation:
-            rotations.extend([90, 270])
-        
-        # Phase 1: Primary methods
-        for rotation in rotations:
-            rotated = self._rotate_image(img, rotation) if rotation else img
-            results = self._try_all_ocr_combinations(
-                rotated, cell_id, expects_rotation, False, rotation
-            )
-            all_results.extend(results)
-            
-            valid = [r for r in results if self._is_text_valid(r.text, r.confidence)]
-            if valid:
-                best = max(valid, key=lambda r: r.quality_score)
-                if best.quality_score >= self.high_confidence_threshold:
-                    return best.text, best.quality_score, best.rotation
-        
-        # Phase 2: Fallback methods
-        if self.enable_fallback_modes:
-            valid = [r for r in all_results if self._is_text_valid(r.text, r.confidence)]
-            current_best = max(valid, key=lambda r: r.quality_score) if valid else None
-            
-            if not current_best or current_best.quality_score < self.minimum_confidence_threshold:
-                for rotation in rotations:
-                    rotated = self._rotate_image(img, rotation) if rotation else img
-                    results = self._try_all_ocr_combinations(
-                        rotated, cell_id, expects_rotation, True, rotation
-                    )
-                    all_results.extend(results)
-        
-        # Phase 3: Higher upscale
-        valid = [r for r in all_results if self._is_text_valid(r.text, r.confidence)]
-        if not valid or max(r.quality_score for r in valid) < self.minimum_confidence_threshold:
-            original = self.upscale_factor
-            self.upscale_factor = 3
-            
-            for rotation in rotations[:2]:
-                rotated = self._rotate_image(img, rotation) if rotation else img
-                results = self._try_all_ocr_combinations(
-                    rotated, cell_id, expects_rotation, False, rotation
-                )
-                all_results.extend(results)
-            
-            self.upscale_factor = original
-        
-        # Select best
-        valid = [r for r in all_results if self._is_text_valid(r.text, r.confidence)]
-        
-        if not valid:
-            semi = [r for r in all_results if r.text.strip() and r.confidence >= self.fallback_confidence_threshold]
-            if semi:
-                best = max(semi, key=lambda r: r.quality_score)
-                return best.text, best.quality_score, best.rotation
-            return "", 0, 0
-        
-        best = max(valid, key=lambda r: r.quality_score)
-        return best.text, best.quality_score, best.rotation
+        if method == 0:
+            return img
+        elif method == 1:
+            lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            l = clahe.apply(l)
+            return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+        elif method == 2:
+            gray = cv2.GaussianBlur(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (3, 3), 0)
+            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            if np.mean(binary) < 127:
+                binary = cv2.bitwise_not(binary)
+            return cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+        return img
 
-    def _post_process_text(self, text: str) -> str:
-        """Post-process extracted text."""
+    def _is_valid_text(self, text: str, conf: float) -> bool:
+        """Check if text is valid."""
+        if not text or not text.strip():
+            return False
+        stripped = text.strip()
+        if not any(c.isalnum() for c in stripped):
+            return False
+        unique = set(stripped.replace(" ", ""))
+        if len(unique) == 1 and len(stripped) > 2:
+            return False
+        return True
+
+    def _calculate_score(self, text: str, conf: float, rotated: bool = False) -> float:
+        """Calculate quality score."""
         if not text:
-            return text
+            return 0.0
+        score = conf
+        length = len(text.strip())
+        if length >= 2:
+            score *= 1.1
+        if length >= 5:
+            score *= 1.1
+        if length <= 1 and conf < 70:
+            score *= 0.5
+        if rotated and length >= 2:
+            score *= 1.15
+        return score
+
+    def extract_cell_text(self, img: np.ndarray, cell: dict) -> str:
+        """Extract text from a cell with word-level correction."""
+        self.stats['cells'] += 1
+        start = time.time()
         
+        pad = 3
+        y1 = max(0, cell["y1"] - pad)
+        y2 = min(img.shape[0], cell["y2"] + pad)
+        x1 = max(0, cell["x1"] - pad)
+        x2 = min(img.shape[1], cell["x2"] + pad)
+        
+        cell_img = img[y1:y2, x1:x2]
+        h, w = cell_img.shape[:2]
+        
+        if h < 3 or w < 3:
+            return ""
+        
+        if self._is_empty(cell_img):
+            self.stats['empty'] += 1
+            return ""
+        
+        try_rotation = self.enable_rotation and cell.get("rowspan", 1) > 1
+        best_text, best_score, best_conf = "", 0.0, 0.0
+        
+        for method in range(self.max_retries + 1):
+            preprocessed = self._preprocess(cell_img, method)
+            text, conf = self._run_ocr(preprocessed)
+            
+            if text and self._is_valid_text(text, conf):
+                score = self._calculate_score(text, conf)
+                if score > best_score:
+                    best_text, best_score, best_conf = text, score, conf
+                if score >= self.high_conf:
+                    break
+        
+        if try_rotation and best_score < self.min_conf:
+            for angle in [90, 270]:
+                rotated = cv2.rotate(cell_img,
+                    cv2.ROTATE_90_CLOCKWISE if angle == 90 else cv2.ROTATE_90_COUNTERCLOCKWISE)
+                text, conf = self._run_ocr(rotated)
+                if text and self._is_valid_text(text, conf):
+                    score = self._calculate_score(text, conf, rotated=True)
+                    if score > best_score:
+                        best_text, best_score, best_conf = text, score, conf
+                    if score >= self.high_conf:
+                        break
+        
+        self.stats['time'] += time.time() - start
+        
+        if best_score >= self.min_conf or (best_text and best_score >= 20):
+            self.stats['success'] += 1
+            
+            # Apply word-level correction
+            if self.enable_validation and self.corrector:
+                corrected_text, new_conf, was_corrected, corrections = \
+                    self.corrector.correct_text(best_text, best_conf)
+                
+                if was_corrected:
+                    self.stats['corrected'] += 1
+                    if self.verbose:
+                        self.logger.debug(f"Corrected: '{best_text}' -> '{corrected_text}'")
+                        for orig, corr in corrections:
+                            self.logger.debug(f"  Word: '{orig}' -> '{corr}'")
+                    return self._clean_text(corrected_text)
+            
+            return self._clean_text(best_text)
+        
+        return ""
+
+    def _clean_text(self, text: str) -> str:
+        """Clean text."""
+        if not text:
+            return ""
         text = " ".join(text.split())
         text = text.replace("|", "I")
-        
-        replacements = {
-            "ã": "ă", "ş": "ș", "ţ": "ț",
-            "Ã": "Ă", "Ş": "Ș", "Ţ": "Ț",
-        }
-        for old, new in replacements.items():
-            text = text.replace(old, new)
-        
-        return text
+        return text.strip()
 
-    @timed_operation("Cell OCR extraction")
-    def extract_cell_text(self, img: np.ndarray, cell: dict) -> str:
-        """Extract text from a cell using OCR."""
-        cell_id = f"Cell[{cell['x1']},{cell['y1']}-{cell['x2']},{cell['y2']}]"
+    def extract_batch(self, img: np.ndarray, cells: List[dict]) -> List[str]:
+        """Extract text from multiple cells."""
+        total = len(cells)
+        self.logger.info(f"Processing {total} cells...")
+        start = time.time()
         
-        with LogContext(__name__, temp_level=logging.DEBUG if self.verbose_logging else logging.WARNING):
-            if self.verbose_logging:
-                self.logger.info("=" * 60)
-                self.logger.info(f"Processing {cell_id}")
-            
-            try:
-                padding = 3
-                y1 = max(0, cell["y1"] - padding)
-                y2 = min(img.shape[0], cell["y2"] + padding)
-                x1 = max(0, cell["x1"] - padding)
-                x2 = min(img.shape[1], cell["x2"] + padding)
-                
-                cell_img = img[y1:y2, x1:x2].copy()
-                
-                if cell_img.size == 0 or cell_img.shape[0] < 5 or cell_img.shape[1] < 5:
-                    return ""
-                
-                gray = cv2.cvtColor(cell_img, cv2.COLOR_BGR2GRAY) if len(cell_img.shape) == 3 else cell_img
-                
-                if self._is_cell_likely_empty(gray, cell_id):
-                    return ""
-                
-                expects_rotation = self._should_try_rotation(cell)
-                best_text, best_score, best_rotation = self._try_ocr_comprehensive(
-                    cell_img, cell_id, expects_rotation
-                )
-                
-                threshold = self.minimum_confidence_threshold
-                if expects_rotation and best_score > threshold * 0.8:
-                    threshold *= 0.8
-                
-                if best_score >= threshold and self._is_text_valid(best_text, best_score):
-                    return self._post_process_text(best_text).strip()
-                
-                if best_text and best_score >= self.fallback_confidence_threshold:
-                    return self._post_process_text(best_text).strip()
-                
-                return ""
-                
-            except Exception as e:
-                self.logger.error(f"{cell_id}: {e}", exc_info=self.verbose_logging)
-                return ""
+        results = []
+        for i, cell in enumerate(cells):
+            if i > 0 and i % 50 == 0:
+                elapsed = time.time() - start
+                rate = i / elapsed if elapsed > 0 else 0
+                self.logger.info(f"Progress: {i}/{total} ({rate:.1f} cells/sec)")
+            results.append(self.extract_cell_text(img, cell))
+        
+        elapsed = time.time() - start
+        success = sum(1 for r in results if r)
+        self.logger.info(f"Completed: {success}/{total} in {elapsed:.1f}s")
+        
+        if self.corrector:
+            cs = self.corrector.get_stats()
+            self.logger.info(f"Words corrected: {cs['words_corrected']} "
+                           f"({cs['exact_corrections']} exact, {cs['fuzzy_corrections']} fuzzy)")
+        
+        return results
 
-    def debug_cell(self, img: np.ndarray, cell: dict, save_path: str = None) -> dict:
-        """Debug a cell's OCR attempts."""
-        cell_id = f"Cell[{cell['x1']},{cell['y1']}-{cell['x2']},{cell['y2']}]"
+    # =========================================================================
+    # Dictionary and Correction API
+    # =========================================================================
+    
+    def add_word_correction(self, incorrect: str, correct: str) -> bool:
+        """
+        Add a word-level correction.
         
-        padding = 3
-        y1 = max(0, cell["y1"] - padding)
-        y2 = min(img.shape[0], cell["y2"] + padding)
-        x1 = max(0, cell["x1"] - padding)
-        x2 = min(img.shape[1], cell["x2"] + padding)
+        Args:
+            incorrect: The incorrect OCR word (e.g., "DeBlgn")
+            correct: The correct word (e.g., "Design")
+            
+        Example:
+            ocr.add_word_correction("DeBlgn", "Design")
+            ocr.add_word_correction("Learnlng", "Learning")
+            
+            # Now "Web DeBlgn" will be corrected to "Web Design"
+            # And "Graphic DeBlgn" will also be corrected to "Graphic Design"
+        """
+        if self.dictionary:
+            return self.dictionary.add_word_correction(incorrect, correct)
+        return False
+
+    def add_word_corrections_batch(self, correct_word: str, variations: List[str]) -> int:
+        """
+        Add multiple incorrect variations for a word.
         
-        cell_img = img[y1:y2, x1:x2].copy()
-        gray = cv2.cvtColor(cell_img, cv2.COLOR_BGR2GRAY) if len(cell_img.shape) == 3 else cell_img
+        Example:
+            ocr.add_word_corrections_batch("Design", [
+                "DeBlgn", "Deslgn", "Des1gn", "Desiqn", "Dcsign"
+            ])
+        """
+        if self.dictionary:
+            return self.dictionary.add_word_corrections_batch(correct_word, variations)
+        return 0
+
+    def add_phrase_correction(self, incorrect: str, correct: str) -> bool:
+        """
+        Add a phrase-level correction (for special multi-word cases).
         
-        debug_info = {
-            "cell_id": cell_id,
-            "size": f"{cell_img.shape[1]}x{cell_img.shape[0]}",
-            "variance": float(np.var(gray)),
-            "std": float(np.std(gray)),
-            "is_empty_detected": self._is_cell_likely_empty(gray),
-            "all_results": [],
+        Use sparingly - prefer word corrections.
+        
+        Example:
+            ocr.add_phrase_correction("et al", "et al.")
+        """
+        if self.dictionary:
+            return self.dictionary.add_phrase_correction(incorrect, correct)
+        return False
+
+    def add_term(self, term: str, category: str = "custom"):
+        """Add a valid term to the dictionary."""
+        if self.dictionary:
+            self.dictionary.add_term(term, category)
+
+    def save_dictionary(self) -> bool:
+        """Save dictionary to file."""
+        if self.dictionary:
+            return self.dictionary.save_dictionary()
+        return False
+
+    def get_word_corrections(self) -> Dict[str, List[str]]:
+        """Get all word corrections."""
+        if self.dictionary:
+            return self.dictionary.get_all_word_corrections()
+        return {}
+
+    def get_unrecognized_words(self, min_occurrences: int = 2) -> List[Tuple[str, int]]:
+        """
+        Get words that weren't corrected, sorted by frequency.
+        Useful for finding new corrections to add.
+        """
+        if self.corrector:
+            return self.corrector.get_unrecognized_words(min_occurrences)
+        return []
+
+    def suggest_word_variations(self, word: str) -> List[str]:
+        """Suggest possible OCR variations of a word."""
+        if self.dictionary:
+            return self.dictionary.suggest_word_variations(word)
+        return []
+
+    def get_stats(self) -> dict:
+        """Get statistics."""
+        stats = self.stats.copy()
+        if stats['cells'] > 0:
+            stats['success_rate'] = stats['success'] / stats['cells'] * 100
+            stats['correction_rate'] = stats['corrected'] / stats['cells'] * 100
+        if self.corrector:
+            stats['corrector'] = self.corrector.get_stats()
+        if self.dictionary:
+            stats['dictionary'] = self.dictionary.get_stats()
+        return stats
+
+    def reset_stats(self):
+        """Reset statistics."""
+        self.stats = {
+            'cells': 0, 'ocr_calls': 0, 'empty': 0,
+            'success': 0, 'time': 0, 'corrected': 0
         }
-        
-        original_verbose = self.verbose_logging
-        self.verbose_logging = True
-        
-        try:
-            if len(cell_img.shape) == 2:
-                cell_img = cv2.cvtColor(cell_img, cv2.COLOR_GRAY2BGR)
-            
-            expects_rotation = self._should_try_rotation(cell)
-            
-            for rotation in [0, 90, 270]:
-                rotated = self._rotate_image(cell_img, rotation) if rotation else cell_img
-                upscaled = self._upscale_image(rotated)
-                
-                for prep_name, prep_func in self._get_preprocessing_methods(True):
-                    text1, conf1 = self._run_paddleocr(upscaled, prep_name, prep_func)
-                    text2, conf2 = self._run_paddleocr_with_file(upscaled, prep_name, prep_func)
-                    
-                    text, conf = (text1, conf1) if conf1 >= conf2 else (text2, conf2)
-                    method = "numpy" if conf1 >= conf2 else "file"
-                    
-                    debug_info["all_results"].append({
-                        "rotation": rotation,
-                        "preprocessing": prep_name,
-                        "text": text,
-                        "confidence": conf,
-                        "quality_score": self._calculate_text_quality_score(text, conf, rotation != 0, expects_rotation),
-                        "is_valid": self._is_text_valid(text, conf) if text else False,
-                        "method": method,
-                    })
-        finally:
-            self.verbose_logging = original_verbose
-        
-        debug_info["all_results"].sort(key=lambda x: x["quality_score"], reverse=True)
-        
-        if save_path:
-            os.makedirs(save_path, exist_ok=True)
-            cv2.imwrite(f"{save_path}/original.png", cell_img)
-            cv2.imwrite(f"{save_path}/gray.png", gray)
-            
-            upscaled = self._upscale_image(cell_img)
-            cv2.imwrite(f"{save_path}/upscaled.png", upscaled)
-            
-            for prep_name, prep_func in self._get_preprocessing_methods(True):
-                processed = prep_func(upscaled)
-                cv2.imwrite(f"{save_path}/prep_{prep_name}.png", processed)
-        
-        return debug_info
+        if self.corrector:
+            self.corrector.reset_stats()
 
     def cleanup(self):
-        """Clean up resources."""
-        with self._ocr_lock:
-            self._ocr = None
+        """Cleanup resources."""
+        CellOCR._ocr_instance = None
 
 
-# Standalone test function
-def test_paddleocr_installation():
-    """Test PaddleOCR installation and functionality."""
-    import sys
-    print(f"Python version: {sys.version}")
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+def create_word_level_dictionary(output_path: str = "schedule_dictionary.json"):
+    """Create a template dictionary with word-level corrections."""
+    dictionary = {
+        "terms": {
+            "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", 
+                    "Saturday", "Sunday"],
+            "subjects": ["Mathematics", "Physics", "Chemistry", "Biology", 
+                        "Computer", "Science", "Engineering", "Design", 
+                        "Machine", "Learning", "Software", "Database"],
+            "schedule_terms": ["Lecture", "Tutorial", "Lab", "Seminar", 
+                             "Workshop", "Exam", "Break"],
+            "locations": ["Room", "Hall", "Building", "Floor", "Lab"],
+            "custom": []
+        },
+        "word_corrections": {
+            # Days - common OCR errors
+            "Monday": ["Mond4y", "M0nday", "Mondav", "Mcnday"],
+            "Tuesday": ["Tuesd4y", "Tu3sday", "Tucsday"],
+            "Wednesday": ["Wednesd4y", "Wedn3sday", "Wcdnesday"],
+            "Thursday": ["Thursd4y", "Th ursday", "Thursdav"],
+            "Friday": ["Frid4y", "Fr1day", "Fridav"],
+            
+            # Common words
+            "Design": ["DeBlgn", "Deslgn", "Des1gn", "Desiqn", "Dcsign"],
+            "Machine": ["Machlne", "Mach1ne", "Machirie", "Machinc"],
+            "Learning": ["Learnlng", "Learn1ng", "Learninq", "Lcarning"],
+            "Computer": ["Cornputer", "C0mputer", "Computcr", "Cornputer"],
+            "Science": ["Sclence", "Sc1ence", "Sciencc", "Scicnce"],
+            "Software": ["Softwarc", "S0ftware", "Softwaro"],
+            "Engineering": ["Englneering", "Engineer1ng", "Enginecring"],
+            "Database": ["Databas3", "Databasc", "Datbase"],
+            "Systems": ["Systerns", "Syst3ms", "Systcms"],
+            
+            # Schedule terms
+            "Lecture": ["Lectur3", "Lcture", "Lecturc", "Lecturo"],
+            "Tutorial": ["Tut0rial", "Tutoria1", "Tutorlal"],
+            "Seminar": ["Semlnar", "Serninar", "Scminar"],
+            "Workshop": ["W0rkshop", "Worksho p", "Vvorkshop"],
+            
+            # Locations
+            "Room": ["R0om", "Roorn", "Rcom"],
+            "Building": ["Bu1lding", "Buildlng", "Buildinq"],
+            "Floor": ["Fl0or", "Fioor", "F1oor"],
+            
+            # Common instructor titles
+            "Prof": ["Pr0f", "Prcf"],
+            "Professor": ["Profcssor", "Profess0r"],
+        },
+        "phrase_corrections": {
+            # Only for special cases that can't be handled word-by-word
+            # Keep this minimal!
+        }
+    }
     
     try:
-        import paddle
-        print(f"PaddlePaddle version: {paddle.__version__}")
-    except ImportError as e:
-        print(f"PaddlePaddle not installed: {e}")
-        return False
-    
-    try:
-        from paddleocr import PaddleOCR
-        print("PaddleOCR imported successfully")
-    except ImportError as e:
-        print(f"PaddleOCR not installed: {e}")
-        return False
-    
-    # Check constructor params
-    print("\n--- PaddleOCR Constructor Parameters ---")
-    try:
-        sig = inspect.signature(PaddleOCR.__init__)
-        params = list(sig.parameters.keys())
-        print(f"Available params: {params}")
-    except Exception as e:
-        print(f"Could not inspect: {e}")
-    
-    # Try minimal init
-    print("\n--- Testing Initialization ---")
-    try:
-        ocr = PaddleOCR(lang='en')
-        print("Initialization successful!")
-    except Exception as e:
-        print(f"Initialization failed: {e}")
-        return False
-    
-    # Check ocr method params
-    print("\n--- OCR Method Parameters ---")
-    try:
-        sig = inspect.signature(ocr.ocr)
-        params = list(sig.parameters.keys())
-        print(f"ocr() params: {params}")
-    except Exception as e:
-        print(f"Could not inspect ocr method: {e}")
-    
-    # Test with synthetic image
-    print("\n--- Testing OCR ---")
-    try:
-        # Create test image
-        test_img = np.ones((100, 400, 3), dtype=np.uint8) * 255
-        cv2.putText(test_img, "Hello World", (10, 70), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 0), 3)
-        
-        # Test with numpy array
-        print("Testing with numpy array...")
-        result = ocr.ocr(test_img)
-        print(f"Numpy result: {result}")
-        
-        # Test with file
-        print("\nTesting with file...")
-        temp_path = "/tmp/paddleocr_test.png"
-        cv2.imwrite(temp_path, test_img)
-        result_file = ocr.ocr(temp_path)
-        print(f"File result: {result_file}")
-        
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)
-        
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(dictionary, f, indent=2, ensure_ascii=False)
+        print(f"Created word-level dictionary at: {output_path}")
         return True
-        
     except Exception as e:
-        print(f"OCR test failed: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Failed: {e}")
         return False
+
+
+def interactive_word_correction_builder(ocr: CellOCR):
+    """Interactive tool to build word corrections."""
+    print("\n" + "=" * 60)
+    print("Interactive Word Correction Builder")
+    print("=" * 60)
+    
+    unrecognized = ocr.get_unrecognized_words(min_occurrences=1)
+    
+    if not unrecognized:
+        print("No unrecognized words to review!")
+        return
+    
+    print(f"\nFound {len(unrecognized)} unrecognized word(s):")
+    print("-" * 40)
+    
+    for i, (word, count) in enumerate(unrecognized[:20], 1):
+        print(f"{i}. '{word}' (appeared {count}x)")
+    
+    print("\n" + "-" * 40)
+    print("Commands:")
+    print("  <number> <correct_word> - Add word correction")
+    print("  s <word> - Show suggested variations for a word")
+    print("  q - Quit and save")
+    print("-" * 40)
+    
+    while True:
+        try:
+            user_input = input("\nCommand: ").strip()
+            
+            if user_input.lower() == 'q':
+                break
+            
+            if user_input.lower().startswith('s '):
+                word = user_input[2:].strip()
+                suggestions = ocr.suggest_word_variations(word)
+                print(f"Suggested variations for '{word}': {suggestions}")
+                continue
+            
+            parts = user_input.split(maxsplit=1)
+            if len(parts) == 2:
+                idx = int(parts[0]) - 1
+                correct_word = parts[1]
+                
+                if 0 <= idx < len(unrecognized):
+                    incorrect_word = unrecognized[idx][0]
+                    
+                    if ocr.add_word_correction(incorrect_word, correct_word):
+                        print(f"✓ Added: '{incorrect_word}' -> '{correct_word}'")
+                        
+                        # Show suggestions
+                        suggestions = ocr.suggest_word_variations(correct_word)
+                        if suggestions:
+                            print(f"  Also consider adding: {suggestions[:5]}")
+                    else:
+                        print("✗ Failed to add")
+                else:
+                    print("Invalid index")
+            else:
+                print("Invalid format. Use: <number> <correct_word>")
+                
+        except (ValueError, KeyboardInterrupt):
+            break
+    
+    if ocr.save_dictionary():
+        print("\n✓ Dictionary saved!")
+
+
+# =============================================================================
+# Tests
+# =============================================================================
+
+def test_word_level_correction():
+    """Test word-level correction functionality."""
+    print("\n" + "=" * 60)
+    print("Testing Word-Level Correction")
+    print("=" * 60)
+    
+    # Create dictionary
+    dictionary = ScheduleDictionary(verbose=True)
+    
+    # Add word corrections
+    print("\n--- Adding word corrections ---")
+    dictionary.add_word_correction("DeBlgn", "Design")
+    dictionary.add_word_correction("Deslgn", "Design")
+    dictionary.add_word_correction("Learnlng", "Learning")
+    dictionary.add_word_correction("Machlne", "Machine")
+    dictionary.add_word_correction("Mond4y", "Monday")
+    
+    print(f"Total word corrections: {len(dictionary.word_corrections)}")
+    
+    # Create corrector
+    corrector = WordLevelCorrector(dictionary, verbose=True)
+    
+    # Test cases
+    test_cases = [
+        # (input, expected_output)
+        ("Web DeBlgn", "Web Design"),
+        ("Graphic Deslgn", "Graphic Design"),
+        ("Machlne Learnlng", "Machine Learning"),
+        ("Deep Learnlng Course", "Deep Learning Course"),
+        ("Mond4y Lecture", "Monday Lecture"),
+        ("Web DeBlgn and Graphic Deslgn", "Web Design and Graphic Design"),
+        ("Normal Text", "Normal Text"),  # No correction needed
+        ("10:30 AM", "10:30 AM"),  # Time - no correction
+    ]
+    
+    print("\n--- Testing corrections ---")
+    for input_text, expected in test_cases:
+        result, conf, corrected, corrections = corrector.correct_text(input_text, 65.0)
+        status = "✓" if result == expected else "✗"
+        print(f"{status} '{input_text}' -> '{result}' (expected: '{expected}')")
+        if corrections:
+            print(f"    Corrections: {corrections}")
+    
+    print("\n--- Statistics ---")
+    for k, v in corrector.get_stats().items():
+        print(f"  {k}: {v}")
+
+
+def test_case_preservation():
+    """Test that case is preserved correctly."""
+    print("\n" + "=" * 60)
+    print("Testing Case Preservation")
+    print("=" * 60)
+    
+    dictionary = ScheduleDictionary()
+    dictionary.add_word_correction("deslgn", "Design")
+    
+    corrector = WordLevelCorrector(dictionary, verbose=True)
+    
+    test_cases = [
+        ("DESLGN", "DESIGN"),  # All caps
+        ("deslgn", "design"),  # All lower
+        ("Deslgn", "Design"),  # Title case
+        ("DeSLGN", "Design"),  # Mixed - uses correct word's case
+    ]
+    
+    print("\n--- Testing case preservation ---")
+    for input_text, expected in test_cases:
+        result, _, _, _ = corrector.correct_text(input_text, 65.0)
+        status = "✓" if result == expected else "✗"
+        print(f"{status} '{input_text}' -> '{result}' (expected: '{expected}')")
+
+
+def test_punctuation_handling():
+    """Test that punctuation is preserved."""
+    print("\n" + "=" * 60)
+    print("Testing Punctuation Handling")
+    print("=" * 60)
+    
+    dictionary = ScheduleDictionary()
+    dictionary.add_word_correction("DeBlgn", "Design")
+    
+    corrector = WordLevelCorrector(dictionary, verbose=True)
+    
+    test_cases = [
+        ("Web DeBlgn.", "Web Design."),
+        ("Web DeBlgn, Graphic DeBlgn", "Web Design, Graphic Design"),
+        ("(DeBlgn)", "(Design)"),
+        ("DeBlgn: Introduction", "Design: Introduction"),
+        ('"DeBlgn"', '"Design"'),
+    ]
+    
+    print("\n--- Testing punctuation ---")
+    for input_text, expected in test_cases:
+        result, _, _, _ = corrector.correct_text(input_text, 65.0)
+        status = "✓" if result == expected else "✗"
+        print(f"{status} '{input_text}' -> '{result}' (expected: '{expected}')")
+
+
+def test_dictionary_efficiency():
+    """Show how word-level corrections are more efficient."""
+    print("\n" + "=" * 60)
+    print("Dictionary Efficiency Comparison")
+    print("=" * 60)
+    
+    # Old way: phrase-level
+    phrase_corrections = {
+        "Web Design": ["Web DeBlgn", "Web Deslgn"],
+        "Graphic Design": ["Graphic DeBlgn", "Graphic Deslgn"],
+        "Machine Learning": ["Machlne Learnlng", "Machine Learnlng"],
+        "Deep Learning": ["Deep Learnlng"],
+    }
+    
+    # New way: word-level
+    word_corrections = {
+        "Design": ["DeBlgn", "Deslgn"],
+        "Machine": ["Machlne"],
+        "Learning": ["Learnlng"],
+    }
+    
+    print("\nOld phrase-level approach:")
+    print(f"  Entries: {sum(len(v) for v in phrase_corrections.values())}")
+    print(f"  Covers: {len(phrase_corrections)} phrases")
+    
+    print("\nNew word-level approach:")
+    print(f"  Entries: {sum(len(v) for v in word_corrections.values())}")
+    print(f"  Covers: ANY combination of these words!")
+    
+    print("\n  Examples of what word-level handles:")
+    dictionary = ScheduleDictionary()
+    for word, variations in word_corrections.items():
+        for var in variations:
+            dictionary.add_word_correction(var, word)
+    
+    corrector = WordLevelCorrector(dictionary)
+    
+    examples = [
+        "Web DeBlgn",
+        "Graphic Deslgn",
+        "UI DeBlgn",
+        "DeBlgn Patterns",
+        "Machlne Learnlng",
+        "Deep Learnlng",
+        "Reinforcement Learnlng",
+    ]
+    
+    for ex in examples:
+        result, _, _, _ = corrector.correct_text(ex, 65.0)
+        print(f"    '{ex}' -> '{result}'")
 
 
 if __name__ == "__main__":
-    test_paddleocr_installation()
+    # Create template dictionary
+    print("Creating word-level dictionary template...")
+    create_word_level_dictionary("schedule_dictionary.json")
+    
+    # Run tests
+    test_word_level_correction()
+    test_case_preservation()
+    test_punctuation_handling()
+    test_dictionary_efficiency()
