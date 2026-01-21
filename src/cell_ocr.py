@@ -16,6 +16,9 @@ import threading
 import time
 from collections import defaultdict
 
+# Use the same default path as dictionary_optimizer
+DEFAULT_DICTIONARY_PATH = "ocr_dictionary.json"
+
 
 @dataclass
 class OCRResult:
@@ -32,16 +35,13 @@ class OCRResult:
 
 class ScheduleDictionary:
     """
-    Dictionary manager with word-level correction support.
+    Dictionary manager with word-level and phrase-level correction support.
     
-    Supports:
-    - Word-level corrections: "DeBlgn" -> "Design"
-    - Phrase-level corrections (optional, for special cases): "et al" -> "et al."
-    - Dictionary terms for validation
+    Loads corrections from the shared dictionary file and provides lookup methods.
     """
     
     def __init__(self, dictionary_path: Optional[str] = None, verbose: bool = False):
-        """Initialize dictionary with word-level correction support."""
+        """Initialize dictionary with correction support."""
         self.logger = logging.getLogger(__name__ + ".Dictionary")
         self.verbose = verbose
         
@@ -57,12 +57,12 @@ class ScheduleDictionary:
             "locations": ["Room", "Hall", "Building", "Floor", "Lab", "Office"],
         }
         
-        # Word-level corrections: incorrect_word -> correct_word
-        self.word_corrections: Dict[str, str] = {}  # lowercase incorrect -> correct (with case)
-        self.word_corrections_by_correct: Dict[str, List[str]] = {}  # correct -> [incorrect variations]
+        # Word-level corrections: incorrect_word (lowercase) -> correct_word
+        self.word_corrections: Dict[str, str] = {}
+        self.word_corrections_by_correct: Dict[str, List[str]] = {}
         
-        # Phrase-level corrections (optional, for special multi-word cases)
-        self.phrase_corrections: Dict[str, str] = {}  # lowercase incorrect phrase -> correct phrase
+        # Phrase-level corrections: incorrect_phrase (lowercase) -> correct_phrase
+        self.phrase_corrections: Dict[str, str] = {}
         self.phrase_corrections_by_correct: Dict[str, List[str]] = {}
         
         # All valid terms for validation
@@ -71,15 +71,11 @@ class ScheduleDictionary:
         
         # Custom terms loaded from file
         self.custom_terms: Dict[str, List[str]] = {}
-        self.custom_word_corrections: Dict[str, List[str]] = {}  # correct -> [variations]
-        self.custom_phrase_corrections: Dict[str, List[str]] = {}  # correct -> [variations]
+        self.custom_word_corrections: Dict[str, List[str]] = {}
+        self.custom_phrase_corrections: Dict[str, List[str]] = {}
         
-        # File path
-        self.dictionary_path = dictionary_path or "schedule_dictionary.json"
-        
-        # Load and build
-        self._load_dictionary()
-        self._build_lookup()
+        # File path - use shared default
+        self.dictionary_path = self._find_dictionary_path(dictionary_path or DEFAULT_DICTIONARY_PATH)
         
         # Character substitutions for suggestions
         self.char_substitutions = {
@@ -93,10 +89,34 @@ class ScheduleDictionary:
             'n': ['ri'], 'ri': ['n'],
         }
         
+        # Load and build
+        self._load_dictionary()
+        self._build_lookup()
+        
         stats = self.get_stats()
-        self.logger.info(f"Dictionary initialized: {stats['word_corrections']} word corrections, "
+        self.logger.info(f"Dictionary initialized from {self.dictionary_path}: "
+                        f"{stats['word_corrections']} word corrections, "
                         f"{stats['phrase_corrections']} phrase corrections, "
                         f"{stats['total_terms']} terms")
+
+    def _find_dictionary_path(self, path: str) -> str:
+        """Find the dictionary file in various locations."""
+        paths_to_check = [
+            path,
+            os.path.join("src", path),
+            os.path.join("src", "ocr_dictionary.json"),
+            "ocr_dictionary.json",
+            os.path.join(os.path.dirname(__file__), path),
+            os.path.join(os.path.dirname(__file__), "ocr_dictionary.json"),
+        ]
+        
+        for p in paths_to_check:
+            if os.path.exists(p):
+                self.logger.info(f"Found dictionary at: {p}")
+                return p
+        
+        self.logger.warning(f"Dictionary not found, checked: {paths_to_check}")
+        return path
 
     def _load_dictionary(self):
         """Load dictionary from JSON file."""
@@ -108,53 +128,55 @@ class ScheduleDictionary:
             with open(self.dictionary_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
+            self.logger.info(f"Loading dictionary from {self.dictionary_path}")
+            self.logger.info(f"Dictionary keys: {list(data.keys())}")
+            
             # Load terms
             self.custom_terms = data.get("terms", {})
             
-            # Load word corrections (new format)
+            # Load word corrections
             self.custom_word_corrections = data.get("word_corrections", {})
+            self.logger.info(f"Loaded {len(self.custom_word_corrections)} word correction entries")
             
-            # Load phrase corrections (optional)
+            # Load phrase corrections
             self.custom_phrase_corrections = data.get("phrase_corrections", {})
+            self.logger.info(f"Loaded {len(self.custom_phrase_corrections)} phrase correction entries")
             
-            # Backward compatibility: convert old "corrections" format
-            if "corrections" in data and not self.custom_word_corrections:
-                self.logger.info("Converting old corrections format to word-level...")
-                self._convert_old_format(data["corrections"])
+            # Also load from typed_corrections if present
+            typed_corrections = data.get("typed_corrections", {})
+            if typed_corrections:
+                self.logger.info(f"Found typed_corrections with types: {list(typed_corrections.keys())}")
+                for type_name, corrections in typed_corrections.items():
+                    for correct_val, variations in corrections.items():
+                        # Determine if word or phrase based on spaces
+                        is_word = ' ' not in correct_val
+                        
+                        for variation in variations:
+                            var_is_word = ' ' not in variation
+                            
+                            if is_word and var_is_word:
+                                # Both are single words - add to word corrections
+                                if correct_val not in self.custom_word_corrections:
+                                    self.custom_word_corrections[correct_val] = []
+                                if variation not in self.custom_word_corrections[correct_val]:
+                                    self.custom_word_corrections[correct_val].append(variation)
+                            else:
+                                # One or both are phrases - add to phrase corrections
+                                if correct_val not in self.custom_phrase_corrections:
+                                    self.custom_phrase_corrections[correct_val] = []
+                                if variation not in self.custom_phrase_corrections[correct_val]:
+                                    self.custom_phrase_corrections[correct_val].append(variation)
             
-            self.logger.info(f"Loaded dictionary from {self.dictionary_path}")
+            self.logger.info(f"After merging typed: {len(self.custom_word_corrections)} word, "
+                           f"{len(self.custom_phrase_corrections)} phrase corrections")
             
         except Exception as e:
             self.logger.warning(f"Failed to load dictionary: {e}")
-
-    def _convert_old_format(self, old_corrections: Dict[str, List[str]]):
-        """Convert old phrase-based corrections to word-level where possible."""
-        for correct_phrase, variations in old_corrections.items():
-            correct_words = correct_phrase.split()
-            
-            if len(correct_words) == 1:
-                # Single word - add as word correction
-                if correct_phrase not in self.custom_word_corrections:
-                    self.custom_word_corrections[correct_phrase] = []
-                for var in variations:
-                    var_words = var.split()
-                    if len(var_words) == 1:
-                        self.custom_word_corrections[correct_phrase].append(var)
-            else:
-                # Multi-word - try to extract word-level corrections
-                for variation in variations:
-                    var_words = variation.split()
-                    if len(var_words) == len(correct_words):
-                        # Same word count - extract individual word corrections
-                        for correct_word, var_word in zip(correct_words, var_words):
-                            if correct_word.lower() != var_word.lower():
-                                if correct_word not in self.custom_word_corrections:
-                                    self.custom_word_corrections[correct_word] = []
-                                if var_word not in self.custom_word_corrections[correct_word]:
-                                    self.custom_word_corrections[correct_word].append(var_word)
+            import traceback
+            traceback.print_exc()
 
     def _build_lookup(self):
-        """Build lookup structures."""
+        """Build lookup structures for fast correction lookup."""
         self.word_corrections.clear()
         self.word_corrections_by_correct.clear()
         self.phrase_corrections.clear()
@@ -167,20 +189,21 @@ class ScheduleDictionary:
             for term in terms:
                 self.all_terms.add(term)
                 self.terms_lower_map[term.lower()] = term
-                # Also add individual words from multi-word terms
                 for word in term.split():
                     if len(word) > 1:
                         self.all_terms.add(word)
                         self.terms_lower_map[word.lower()] = word
         
         # Build word corrections lookup
+        # Format: correct_word -> [list of incorrect variations]
+        # We need: incorrect_word (lowercase) -> correct_word
         for correct_word, variations in self.custom_word_corrections.items():
             self.word_corrections_by_correct[correct_word] = variations
-            # Add correct word to terms
             self.all_terms.add(correct_word)
             self.terms_lower_map[correct_word.lower()] = correct_word
             
             for variation in variations:
+                # Map lowercase variation to correct word
                 self.word_corrections[variation.lower()] = correct_word
                 if self.verbose:
                     self.logger.debug(f"Word correction: '{variation}' -> '{correct_word}'")
@@ -190,6 +213,17 @@ class ScheduleDictionary:
             self.phrase_corrections_by_correct[correct_phrase] = variations
             for variation in variations:
                 self.phrase_corrections[variation.lower()] = correct_phrase
+                if self.verbose:
+                    self.logger.debug(f"Phrase correction: '{variation}' -> '{correct_phrase}'")
+        
+        self.logger.info(f"Built lookup: {len(self.word_corrections)} word mappings, "
+                        f"{len(self.phrase_corrections)} phrase mappings")
+
+    def reload(self):
+        """Reload dictionary from file."""
+        self.logger.info("Reloading dictionary...")
+        self._load_dictionary()
+        self._build_lookup()
 
     def save_dictionary(self) -> bool:
         """Save dictionary to JSON file."""
@@ -214,47 +248,27 @@ class ScheduleDictionary:
     # =========================================================================
     
     def add_word_correction(self, incorrect: str, correct: str) -> bool:
-        """
-        Add a word-level correction.
-        
-        Args:
-            incorrect: The incorrect OCR word (e.g., "DeBlgn")
-            correct: The correct word (e.g., "Design")
-            
-        Returns:
-            True if added successfully
-            
-        Example:
-            dictionary.add_word_correction("DeBlgn", "Design")
-            dictionary.add_word_correction("Learnlng", "Learning")
-        """
+        """Add a word-level correction."""
         if not incorrect or not correct:
             return False
         
         incorrect = incorrect.strip()
         correct = correct.strip()
         
-        # Don't add if same
         if incorrect.lower() == correct.lower():
             return False
         
-        # Don't add multi-word as word correction
         if ' ' in incorrect or ' ' in correct:
             self.logger.warning(f"Use add_phrase_correction for multi-word: '{incorrect}' -> '{correct}'")
             return False
         
-        # Add to custom corrections
         if correct not in self.custom_word_corrections:
             self.custom_word_corrections[correct] = []
         
         if incorrect not in self.custom_word_corrections[correct]:
             self.custom_word_corrections[correct].append(incorrect)
-            
-            # Update lookup
             self.word_corrections[incorrect.lower()] = correct
             self.word_corrections_by_correct[correct] = self.custom_word_corrections[correct]
-            
-            # Add correct word to terms
             self.all_terms.add(correct)
             self.terms_lower_map[correct.lower()] = correct
             
@@ -264,21 +278,7 @@ class ScheduleDictionary:
         return False
 
     def add_word_corrections_batch(self, correct_word: str, variations: List[str]) -> int:
-        """
-        Add multiple incorrect variations for a word.
-        
-        Args:
-            correct_word: The correct word
-            variations: List of incorrect variations
-            
-        Returns:
-            Number of corrections added
-            
-        Example:
-            dictionary.add_word_corrections_batch("Design", [
-                "DeBlgn", "Deslgn", "Des1gn", "Desiqn"
-            ])
-        """
+        """Add multiple incorrect variations for a word."""
         added = 0
         for variation in variations:
             if self.add_word_correction(variation, correct_word):
@@ -287,27 +287,24 @@ class ScheduleDictionary:
 
     def get_word_correction(self, word: str) -> Optional[str]:
         """
-        Get correction for a single word (exact match).
+        Get correction for a single word (exact match on lowercase).
         
         Args:
             word: The word to look up
             
         Returns:
-            Corrected word or None
+            Corrected word or None if no correction found
         """
-        return self.word_corrections.get(word.lower())
+        if not word:
+            return None
+        
+        correction = self.word_corrections.get(word.lower())
+        if correction and self.verbose:
+            self.logger.debug(f"Found word correction: '{word}' -> '{correction}'")
+        return correction
 
     def find_similar_word_correction(self, word: str, threshold: float = 0.80) -> Optional[Tuple[str, float]]:
-        """
-        Find similar word correction using fuzzy matching.
-        
-        Args:
-            word: The word to match
-            threshold: Minimum similarity (0-1)
-            
-        Returns:
-            Tuple of (corrected_word, similarity) or None
-        """
+        """Find similar word correction using fuzzy matching."""
         if not word or len(word) < 2:
             return None
         
@@ -322,7 +319,6 @@ class ScheduleDictionary:
         best_ratio = threshold
         
         for incorrect_lower, correct in self.word_corrections.items():
-            # Skip if length difference too large
             if abs(len(word) - len(incorrect_lower)) > max(2, len(word) * 0.3):
                 continue
             
@@ -337,19 +333,11 @@ class ScheduleDictionary:
         return None
 
     # =========================================================================
-    # Phrase-Level Correction Methods (for special cases)
+    # Phrase-Level Correction Methods
     # =========================================================================
     
     def add_phrase_correction(self, incorrect: str, correct: str) -> bool:
-        """
-        Add a phrase-level correction (for special multi-word cases).
-        
-        Use this sparingly - prefer word-level corrections.
-        
-        Args:
-            incorrect: The incorrect phrase
-            correct: The correct phrase
-        """
+        """Add a phrase-level correction."""
         if not incorrect or not correct:
             return False
         
@@ -373,8 +361,43 @@ class ScheduleDictionary:
         return False
 
     def get_phrase_correction(self, phrase: str) -> Optional[str]:
-        """Get correction for a phrase (exact match)."""
-        return self.phrase_corrections.get(phrase.lower())
+        """Get correction for a phrase (exact match on lowercase)."""
+        if not phrase:
+            return None
+        
+        correction = self.phrase_corrections.get(phrase.lower())
+        if correction and self.verbose:
+            self.logger.debug(f"Found phrase correction: '{phrase}' -> '{correction}'")
+        return correction
+
+    def find_similar_phrase_correction(self, phrase: str, threshold: float = 0.85) -> Optional[Tuple[str, float]]:
+        """Find similar phrase correction using fuzzy matching."""
+        if not phrase or len(phrase) < 3:
+            return None
+        
+        phrase_lower = phrase.lower()
+        
+        # Exact match first
+        if phrase_lower in self.phrase_corrections:
+            return (self.phrase_corrections[phrase_lower], 1.0)
+        
+        # Fuzzy match
+        best_match = None
+        best_ratio = threshold
+        
+        for incorrect_lower, correct in self.phrase_corrections.items():
+            if abs(len(phrase) - len(incorrect_lower)) > max(5, len(phrase) * 0.3):
+                continue
+            
+            ratio = SequenceMatcher(None, phrase_lower, incorrect_lower).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_match = correct
+        
+        if best_match:
+            return (best_match, best_ratio)
+        
+        return None
 
     # =========================================================================
     # Term Validation Methods
@@ -397,7 +420,6 @@ class ScheduleDictionary:
     def is_valid_word(self, word: str) -> bool:
         """Check if a single word is valid/known."""
         word_lower = word.lower()
-        # Valid if it's a term or a correct word in corrections
         return (word_lower in self.terms_lower_map or 
                 any(w.lower() == word_lower for w in self.word_corrections_by_correct.keys()))
 
@@ -469,7 +491,6 @@ class ScheduleDictionary:
                 for replacement in replacements:
                     suggestions.add(word.replace(pattern, replacement))
         
-        # Filter existing corrections
         suggestions = {s for s in suggestions 
                       if s.lower() not in self.word_corrections and s.lower() != word.lower()}
         
@@ -482,13 +503,14 @@ class ScheduleDictionary:
             "word_corrections": len(self.word_corrections),
             "phrase_corrections": len(self.phrase_corrections),
             "unique_correct_words": len(self.word_corrections_by_correct),
+            "unique_correct_phrases": len(self.phrase_corrections_by_correct),
             "categories": len(self.custom_terms)
         }
 
 
 class WordLevelCorrector:
     """
-    Corrects OCR text word by word.
+    Corrects OCR text word by word and phrase by phrase.
     """
     
     def __init__(self, dictionary: ScheduleDictionary, verbose: bool = False):
@@ -520,7 +542,7 @@ class WordLevelCorrector:
 
     def correct_text(self, text: str, confidence: float = 50.0) -> Tuple[str, float, bool, List[Tuple[str, str]]]:
         """
-        Correct OCR text word by word.
+        Correct OCR text using word and phrase corrections.
         
         Args:
             text: The OCR text to correct
@@ -537,27 +559,50 @@ class WordLevelCorrector:
         original_text = text
         corrections_made = []
         
-        # Step 1: Check for phrase-level corrections first (exact match)
+        # Step 1: Check for full phrase correction (exact match)
         phrase_correction = self.dictionary.get_phrase_correction(text)
         if phrase_correction:
             self.stats['phrases_corrected'] += 1
             if self.verbose:
-                self.logger.debug(f"Phrase correction: '{text}' -> '{phrase_correction}'")
+                self.logger.debug(f"Full phrase correction: '{text}' -> '{phrase_correction}'")
             return phrase_correction, min(confidence + 15, 98), True, [(text, phrase_correction)]
         
-        # Step 2: Split into tokens (words and separators)
-        tokens = self._tokenize(text)
+        # Step 2: Try fuzzy phrase matching for longer texts with low confidence
+        if len(text) > 10 and confidence < 70:
+            fuzzy_phrase = self.dictionary.find_similar_phrase_correction(text, threshold=0.85)
+            if fuzzy_phrase:
+                self.stats['phrases_corrected'] += 1
+                if self.verbose:
+                    self.logger.debug(f"Fuzzy phrase correction ({fuzzy_phrase[1]:.2f}): '{text}' -> '{fuzzy_phrase[0]}'")
+                return fuzzy_phrase[0], min(confidence + 12, 95), True, [(text, fuzzy_phrase[0])]
+        
+        # Step 3: Check for partial phrase corrections within the text
+        corrected_text = text
+        for incorrect_phrase, correct_phrase in self.dictionary.phrase_corrections.items():
+            if incorrect_phrase in corrected_text.lower():
+                # Find the actual case in the original text
+                start_idx = corrected_text.lower().find(incorrect_phrase)
+                if start_idx >= 0:
+                    original_segment = corrected_text[start_idx:start_idx + len(incorrect_phrase)]
+                    corrected_text = (corrected_text[:start_idx] + 
+                                     correct_phrase + 
+                                     corrected_text[start_idx + len(incorrect_phrase):])
+                    corrections_made.append((original_segment, correct_phrase))
+                    self.stats['phrases_corrected'] += 1
+                    if self.verbose:
+                        self.logger.debug(f"Partial phrase correction: '{original_segment}' -> '{correct_phrase}'")
+        
+        # Step 4: Word-by-word correction
+        tokens = self._tokenize(corrected_text)
         corrected_tokens = []
         
         for token, is_word in tokens:
             if not is_word:
-                # Separator (space, punctuation) - keep as is
                 corrected_tokens.append(token)
                 continue
             
             self.stats['words_processed'] += 1
             
-            # Try to correct the word
             corrected_word, correction_type = self._correct_word(token, confidence)
             
             if corrected_word != token:
@@ -574,13 +619,10 @@ class WordLevelCorrector:
             
             corrected_tokens.append(corrected_word)
         
-        # Reconstruct text
         corrected_text = ''.join(corrected_tokens)
         
-        # Calculate new confidence
         was_corrected = len(corrections_made) > 0
         if was_corrected:
-            # Boost confidence based on number of corrections
             conf_boost = min(len(corrections_made) * 5, 15)
             new_confidence = min(confidence + conf_boost, 95)
         else:
@@ -589,20 +631,13 @@ class WordLevelCorrector:
         return corrected_text, new_confidence, was_corrected, corrections_made
 
     def _tokenize(self, text: str) -> List[Tuple[str, bool]]:
-        """
-        Split text into tokens, preserving separators.
-        
-        Returns:
-            List of (token, is_word) tuples
-        """
+        """Split text into tokens, preserving separators."""
         tokens = []
         parts = self.word_pattern.split(text)
         
         for part in parts:
             if not part:
                 continue
-            
-            # Check if it's a word (alphanumeric) or separator
             is_word = bool(re.match(r'^\w+$', part))
             tokens.append((part, is_word))
         
@@ -616,18 +651,15 @@ class WordLevelCorrector:
             Tuple of (corrected_word, correction_type)
             correction_type: 'exact', 'fuzzy', 'none'
         """
-        # Skip short words
         if len(word) < 2:
             return word, 'none'
         
-        # Skip numbers and times
         if self.number_pattern.match(word) or self.time_pattern.match(word):
             return word, 'none'
         
         # Step 1: Exact word correction
         exact_correction = self.dictionary.get_word_correction(word)
         if exact_correction:
-            # Preserve original case pattern if possible
             return self._apply_case(word, exact_correction), 'exact'
         
         # Step 2: Check if word is already valid
@@ -641,7 +673,7 @@ class WordLevelCorrector:
             if fuzzy_result:
                 return self._apply_case(word, fuzzy_result[0]), 'fuzzy'
         
-        # Step 4: Fuzzy term matching (for lower confidence)
+        # Step 4: Fuzzy term matching
         if confidence < 80:
             fuzzy_term = self.dictionary.find_similar_term(word, threshold=0.80)
             if fuzzy_term:
@@ -654,30 +686,17 @@ class WordLevelCorrector:
         return word, 'none'
 
     def _apply_case(self, original: str, corrected: str) -> str:
-        """
-        Apply the case pattern from original to corrected.
-        
-        Examples:
-            original="DESIGN", corrected="Design" -> "DESIGN"
-            original="design", corrected="Design" -> "design"
-            original="Design", corrected="design" -> "Design"
-        """
+        """Apply the case pattern from original to corrected."""
         if not original or not corrected:
             return corrected
         
-        # All uppercase
         if original.isupper():
             return corrected.upper()
-        
-        # All lowercase
         if original.islower():
             return corrected.lower()
-        
-        # Title case (first letter uppercase)
         if original[0].isupper() and (len(original) == 1 or original[1:].islower()):
             return corrected.capitalize()
         
-        # Keep corrected word's case (it's the "proper" form)
         return corrected
 
     def _track_unrecognized(self, word: str):
@@ -687,12 +706,7 @@ class WordLevelCorrector:
         self.stats['unrecognized'] += 1
 
     def get_unrecognized_words(self, min_occurrences: int = 1) -> List[Tuple[str, int]]:
-        """
-        Get unrecognized words sorted by frequency.
-        
-        Returns:
-            List of (word, count) tuples
-        """
+        """Get unrecognized words sorted by frequency."""
         filtered = [(w, c) for w, c in self.unrecognized_words.items() if c >= min_occurrences]
         return sorted(filtered, key=lambda x: x[1], reverse=True)
 
@@ -750,7 +764,6 @@ class CellOCR:
         self.max_retries = max_retries
         self.enable_validation = enable_validation
         
-        # Setup logger
         self.logger = logging.getLogger(__name__)
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
@@ -760,16 +773,16 @@ class CellOCR:
         
         self.lang = self._parse_lang(languages)
         
-        # Initialize dictionary and corrector
+        # Initialize dictionary and corrector - use shared default path
         if self.enable_validation:
-            self.dictionary = ScheduleDictionary(dictionary_path, verbose=verbose_logging)
+            dict_path = dictionary_path or DEFAULT_DICTIONARY_PATH
+            self.dictionary = ScheduleDictionary(dict_path, verbose=verbose_logging)
             self.corrector = WordLevelCorrector(self.dictionary, verbose=verbose_logging)
-            self.logger.info("Word-level correction enabled")
+            self.logger.info(f"Word-level correction enabled with dictionary: {self.dictionary.dictionary_path}")
         else:
             self.dictionary = None
             self.corrector = None
         
-        # Stats
         self.stats = {
             'cells': 0, 'ocr_calls': 0, 'empty': 0,
             'success': 0, 'time': 0, 'corrected': 0
@@ -801,7 +814,23 @@ class CellOCR:
             from paddleocr import PaddleOCR
             
             try:
-                CellOCR._ocr_instance = PaddleOCR(lang=self.lang, show_log=self.verbose)
+                CellOCR._ocr_instance = PaddleOCR(
+                    lang="latin",
+                    show_log=False,
+
+                    # Detection (good for small printed text)
+                    text_det_limit_type="max",
+                    text_det_limit_side_len=1280,
+                    text_det_thresh=0.25,
+                    text_det_box_thresh=0.55,
+                    text_det_unclip_ratio=1.6,
+
+                    # Recognition
+                    text_rec_score_thresh=0.5,
+                    # Recognition input width (helps prevent truncation on long single-line text)
+                    text_rec_input_shape="3,48,960",
+                    text_recognition_batch_size=1,
+                )
             except Exception as e:
                 self.logger.warning(f"Init failed: {e}")
                 CellOCR._ocr_instance = PaddleOCR(lang=self.lang)
@@ -1052,7 +1081,7 @@ class CellOCR:
                     if self.verbose:
                         self.logger.debug(f"Corrected: '{best_text}' -> '{corrected_text}'")
                         for orig, corr in corrections:
-                            self.logger.debug(f"  Word: '{orig}' -> '{corr}'")
+                            self.logger.debug(f"  '{orig}' -> '{corr}'")
                     return self._clean_text(corrected_text)
             
             return self._clean_text(best_text)
@@ -1088,7 +1117,8 @@ class CellOCR:
         if self.corrector:
             cs = self.corrector.get_stats()
             self.logger.info(f"Words corrected: {cs['words_corrected']} "
-                           f"({cs['exact_corrections']} exact, {cs['fuzzy_corrections']} fuzzy)")
+                           f"({cs['exact_corrections']} exact, {cs['fuzzy_corrections']} fuzzy), "
+                           f"Phrases: {cs['phrases_corrected']}")
         
         return results
 
@@ -1096,47 +1126,26 @@ class CellOCR:
     # Dictionary and Correction API
     # =========================================================================
     
+    def reload_dictionary(self):
+        """Reload the dictionary from file."""
+        if self.dictionary:
+            self.dictionary.reload()
+            self.logger.info("Dictionary reloaded")
+
     def add_word_correction(self, incorrect: str, correct: str) -> bool:
-        """
-        Add a word-level correction.
-        
-        Args:
-            incorrect: The incorrect OCR word (e.g., "DeBlgn")
-            correct: The correct word (e.g., "Design")
-            
-        Example:
-            ocr.add_word_correction("DeBlgn", "Design")
-            ocr.add_word_correction("Learnlng", "Learning")
-            
-            # Now "Web DeBlgn" will be corrected to "Web Design"
-            # And "Graphic DeBlgn" will also be corrected to "Graphic Design"
-        """
+        """Add a word-level correction."""
         if self.dictionary:
             return self.dictionary.add_word_correction(incorrect, correct)
         return False
 
     def add_word_corrections_batch(self, correct_word: str, variations: List[str]) -> int:
-        """
-        Add multiple incorrect variations for a word.
-        
-        Example:
-            ocr.add_word_corrections_batch("Design", [
-                "DeBlgn", "Deslgn", "Des1gn", "Desiqn", "Dcsign"
-            ])
-        """
+        """Add multiple incorrect variations for a word."""
         if self.dictionary:
             return self.dictionary.add_word_corrections_batch(correct_word, variations)
         return 0
 
     def add_phrase_correction(self, incorrect: str, correct: str) -> bool:
-        """
-        Add a phrase-level correction (for special multi-word cases).
-        
-        Use sparingly - prefer word corrections.
-        
-        Example:
-            ocr.add_phrase_correction("et al", "et al.")
-        """
+        """Add a phrase-level correction."""
         if self.dictionary:
             return self.dictionary.add_phrase_correction(incorrect, correct)
         return False
@@ -1159,10 +1168,7 @@ class CellOCR:
         return {}
 
     def get_unrecognized_words(self, min_occurrences: int = 2) -> List[Tuple[str, int]]:
-        """
-        Get words that weren't corrected, sorted by frequency.
-        Useful for finding new corrections to add.
-        """
+        """Get words that weren't corrected, sorted by frequency."""
         if self.corrector:
             return self.corrector.get_unrecognized_words(min_occurrences)
         return []
@@ -1176,7 +1182,7 @@ class CellOCR:
     def get_stats(self) -> dict:
         """Get statistics."""
         stats = self.stats.copy()
-        if stats['cells'] > 0:
+        if stats['cells']  > 0:
             stats['success_rate'] = stats['success'] / stats['cells'] * 100
             stats['correction_rate'] = stats['corrected'] / stats['cells'] * 100
         if self.corrector:
@@ -1200,302 +1206,68 @@ class CellOCR:
 
 
 # =============================================================================
-# Utility Functions
-# =============================================================================
-
-def create_word_level_dictionary(output_path: str = "schedule_dictionary.json"):
-    """Create a template dictionary with word-level corrections."""
-    dictionary = {
-        "terms": {
-            "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", 
-                    "Saturday", "Sunday"],
-            "subjects": ["Mathematics", "Physics", "Chemistry", "Biology", 
-                        "Computer", "Science", "Engineering", "Design", 
-                        "Machine", "Learning", "Software", "Database"],
-            "schedule_terms": ["Lecture", "Tutorial", "Lab", "Seminar", 
-                             "Workshop", "Exam", "Break"],
-            "locations": ["Room", "Hall", "Building", "Floor", "Lab"],
-            "custom": []
-        },
-        "word_corrections": {
-            # Days - common OCR errors
-            "Monday": ["Mond4y", "M0nday", "Mondav", "Mcnday"],
-            "Tuesday": ["Tuesd4y", "Tu3sday", "Tucsday"],
-            "Wednesday": ["Wednesd4y", "Wedn3sday", "Wcdnesday"],
-            "Thursday": ["Thursd4y", "Th ursday", "Thursdav"],
-            "Friday": ["Frid4y", "Fr1day", "Fridav"],
-            
-            # Common words
-            "Design": ["DeBlgn", "Deslgn", "Des1gn", "Desiqn", "Dcsign"],
-            "Machine": ["Machlne", "Mach1ne", "Machirie", "Machinc"],
-            "Learning": ["Learnlng", "Learn1ng", "Learninq", "Lcarning"],
-            "Computer": ["Cornputer", "C0mputer", "Computcr", "Cornputer"],
-            "Science": ["Sclence", "Sc1ence", "Sciencc", "Scicnce"],
-            "Software": ["Softwarc", "S0ftware", "Softwaro"],
-            "Engineering": ["Englneering", "Engineer1ng", "Enginecring"],
-            "Database": ["Databas3", "Databasc", "Datbase"],
-            "Systems": ["Systerns", "Syst3ms", "Systcms"],
-            
-            # Schedule terms
-            "Lecture": ["Lectur3", "Lcture", "Lecturc", "Lecturo"],
-            "Tutorial": ["Tut0rial", "Tutoria1", "Tutorlal"],
-            "Seminar": ["Semlnar", "Serninar", "Scminar"],
-            "Workshop": ["W0rkshop", "Worksho p", "Vvorkshop"],
-            
-            # Locations
-            "Room": ["R0om", "Roorn", "Rcom"],
-            "Building": ["Bu1lding", "Buildlng", "Buildinq"],
-            "Floor": ["Fl0or", "Fioor", "F1oor"],
-            
-            # Common instructor titles
-            "Prof": ["Pr0f", "Prcf"],
-            "Professor": ["Profcssor", "Profess0r"],
-        },
-        "phrase_corrections": {
-            # Only for special cases that can't be handled word-by-word
-            # Keep this minimal!
-        }
-    }
-    
-    try:
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(dictionary, f, indent=2, ensure_ascii=False)
-        print(f"Created word-level dictionary at: {output_path}")
-        return True
-    except Exception as e:
-        print(f"Failed: {e}")
-        return False
-
-
-def interactive_word_correction_builder(ocr: CellOCR):
-    """Interactive tool to build word corrections."""
-    print("\n" + "=" * 60)
-    print("Interactive Word Correction Builder")
-    print("=" * 60)
-    
-    unrecognized = ocr.get_unrecognized_words(min_occurrences=1)
-    
-    if not unrecognized:
-        print("No unrecognized words to review!")
-        return
-    
-    print(f"\nFound {len(unrecognized)} unrecognized word(s):")
-    print("-" * 40)
-    
-    for i, (word, count) in enumerate(unrecognized[:20], 1):
-        print(f"{i}. '{word}' (appeared {count}x)")
-    
-    print("\n" + "-" * 40)
-    print("Commands:")
-    print("  <number> <correct_word> - Add word correction")
-    print("  s <word> - Show suggested variations for a word")
-    print("  q - Quit and save")
-    print("-" * 40)
-    
-    while True:
-        try:
-            user_input = input("\nCommand: ").strip()
-            
-            if user_input.lower() == 'q':
-                break
-            
-            if user_input.lower().startswith('s '):
-                word = user_input[2:].strip()
-                suggestions = ocr.suggest_word_variations(word)
-                print(f"Suggested variations for '{word}': {suggestions}")
-                continue
-            
-            parts = user_input.split(maxsplit=1)
-            if len(parts) == 2:
-                idx = int(parts[0]) - 1
-                correct_word = parts[1]
-                
-                if 0 <= idx < len(unrecognized):
-                    incorrect_word = unrecognized[idx][0]
-                    
-                    if ocr.add_word_correction(incorrect_word, correct_word):
-                        print(f"✓ Added: '{incorrect_word}' -> '{correct_word}'")
-                        
-                        # Show suggestions
-                        suggestions = ocr.suggest_word_variations(correct_word)
-                        if suggestions:
-                            print(f"  Also consider adding: {suggestions[:5]}")
-                    else:
-                        print("✗ Failed to add")
-                else:
-                    print("Invalid index")
-            else:
-                print("Invalid format. Use: <number> <correct_word>")
-                
-        except (ValueError, KeyboardInterrupt):
-            break
-    
-    if ocr.save_dictionary():
-        print("\n✓ Dictionary saved!")
-
-
-# =============================================================================
 # Tests
 # =============================================================================
 
-def test_word_level_correction():
-    """Test word-level correction functionality."""
-    print("\n" + "=" * 60)
-    print("Testing Word-Level Correction")
-    print("=" * 60)
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
     
-    # Create dictionary
-    dictionary = ScheduleDictionary(verbose=True)
+    print("Testing ScheduleDictionary loading...")
     
-    # Add word corrections
-    print("\n--- Adding word corrections ---")
-    dictionary.add_word_correction("DeBlgn", "Design")
-    dictionary.add_word_correction("Deslgn", "Design")
-    dictionary.add_word_correction("Learnlng", "Learning")
-    dictionary.add_word_correction("Machlne", "Machine")
-    dictionary.add_word_correction("Mond4y", "Monday")
+    # Create a test dictionary
+    test_dict = {
+        "terms": {
+            "days": ["Monday", "Tuesday"],
+            "subjects": ["Physics", "Mathematics"]
+        },
+        "word_corrections": {
+            "Monday": ["Mond4y", "M0nday"],
+            "Physics": ["Physlcs", "Phys1cs"],
+            "Lecture": ["Lcture", "Lectur3"]
+        },
+        "phrase_corrections": {
+            "Conf. dr.": ["Caat dc.", "Conf dc."],
+            "T Petrisor": ["TRetris", "T Petriso"]
+        },
+        "typed_corrections": {
+            "professor": {
+                "Conf. dr.": ["Caat dc."],
+                "T Petrisor": ["TRetris"]
+            },
+            "day": {
+                "Monday": ["Mond4y"]
+            }
+        }
+    }
     
-    print(f"Total word corrections: {len(dictionary.word_corrections)}")
+    # Save test dictionary
+    test_path = "test_ocr_dictionary.json"
+    with open(test_path, 'w') as f:
+        json.dump(test_dict, f, indent=2)
     
-    # Create corrector
+    # Test loading
+    dictionary = ScheduleDictionary(test_path, verbose=True)
+    print(f"\nStats: {dictionary.get_stats()}")
+    
+    # Test corrections
     corrector = WordLevelCorrector(dictionary, verbose=True)
     
-    # Test cases
     test_cases = [
-        # (input, expected_output)
-        ("Web DeBlgn", "Web Design"),
-        ("Graphic Deslgn", "Graphic Design"),
-        ("Machlne Learnlng", "Machine Learning"),
-        ("Deep Learnlng Course", "Deep Learning Course"),
-        ("Mond4y Lecture", "Monday Lecture"),
-        ("Web DeBlgn and Graphic Deslgn", "Web Design and Graphic Design"),
-        ("Normal Text", "Normal Text"),  # No correction needed
-        ("10:30 AM", "10:30 AM"),  # Time - no correction
+        ("Mond4y Lcture", 65.0),
+        ("Physlcs Lab", 70.0),
+        ("Caat dc. TRetris", 60.0),
+        ("Hello World", 80.0),
     ]
     
     print("\n--- Testing corrections ---")
-    for input_text, expected in test_cases:
-        result, conf, corrected, corrections = corrector.correct_text(input_text, 65.0)
-        status = "✓" if result == expected else "✗"
-        print(f"{status} '{input_text}' -> '{result}' (expected: '{expected}')")
+    for text, conf in test_cases:
+        result, new_conf, corrected, corrections = corrector.correct_text(text, conf)
+        print(f"'{text}' -> '{result}' (corrected: {corrected})")
         if corrections:
-            print(f"    Corrections: {corrections}")
+            for orig, corr in corrections:
+                print(f"    '{orig}' -> '{corr}'")
     
-    print("\n--- Statistics ---")
-    for k, v in corrector.get_stats().items():
-        print(f"  {k}: {v}")
-
-
-def test_case_preservation():
-    """Test that case is preserved correctly."""
-    print("\n" + "=" * 60)
-    print("Testing Case Preservation")
-    print("=" * 60)
-    
-    dictionary = ScheduleDictionary()
-    dictionary.add_word_correction("deslgn", "Design")
-    
-    corrector = WordLevelCorrector(dictionary, verbose=True)
-    
-    test_cases = [
-        ("DESLGN", "DESIGN"),  # All caps
-        ("deslgn", "design"),  # All lower
-        ("Deslgn", "Design"),  # Title case
-        ("DeSLGN", "Design"),  # Mixed - uses correct word's case
-    ]
-    
-    print("\n--- Testing case preservation ---")
-    for input_text, expected in test_cases:
-        result, _, _, _ = corrector.correct_text(input_text, 65.0)
-        status = "✓" if result == expected else "✗"
-        print(f"{status} '{input_text}' -> '{result}' (expected: '{expected}')")
-
-
-def test_punctuation_handling():
-    """Test that punctuation is preserved."""
-    print("\n" + "=" * 60)
-    print("Testing Punctuation Handling")
-    print("=" * 60)
-    
-    dictionary = ScheduleDictionary()
-    dictionary.add_word_correction("DeBlgn", "Design")
-    
-    corrector = WordLevelCorrector(dictionary, verbose=True)
-    
-    test_cases = [
-        ("Web DeBlgn.", "Web Design."),
-        ("Web DeBlgn, Graphic DeBlgn", "Web Design, Graphic Design"),
-        ("(DeBlgn)", "(Design)"),
-        ("DeBlgn: Introduction", "Design: Introduction"),
-        ('"DeBlgn"', '"Design"'),
-    ]
-    
-    print("\n--- Testing punctuation ---")
-    for input_text, expected in test_cases:
-        result, _, _, _ = corrector.correct_text(input_text, 65.0)
-        status = "✓" if result == expected else "✗"
-        print(f"{status} '{input_text}' -> '{result}' (expected: '{expected}')")
-
-
-def test_dictionary_efficiency():
-    """Show how word-level corrections are more efficient."""
-    print("\n" + "=" * 60)
-    print("Dictionary Efficiency Comparison")
-    print("=" * 60)
-    
-    # Old way: phrase-level
-    phrase_corrections = {
-        "Web Design": ["Web DeBlgn", "Web Deslgn"],
-        "Graphic Design": ["Graphic DeBlgn", "Graphic Deslgn"],
-        "Machine Learning": ["Machlne Learnlng", "Machine Learnlng"],
-        "Deep Learning": ["Deep Learnlng"],
-    }
-    
-    # New way: word-level
-    word_corrections = {
-        "Design": ["DeBlgn", "Deslgn"],
-        "Machine": ["Machlne"],
-        "Learning": ["Learnlng"],
-    }
-    
-    print("\nOld phrase-level approach:")
-    print(f"  Entries: {sum(len(v) for v in phrase_corrections.values())}")
-    print(f"  Covers: {len(phrase_corrections)} phrases")
-    
-    print("\nNew word-level approach:")
-    print(f"  Entries: {sum(len(v) for v in word_corrections.values())}")
-    print(f"  Covers: ANY combination of these words!")
-    
-    print("\n  Examples of what word-level handles:")
-    dictionary = ScheduleDictionary()
-    for word, variations in word_corrections.items():
-        for var in variations:
-            dictionary.add_word_correction(var, word)
-    
-    corrector = WordLevelCorrector(dictionary)
-    
-    examples = [
-        "Web DeBlgn",
-        "Graphic Deslgn",
-        "UI DeBlgn",
-        "DeBlgn Patterns",
-        "Machlne Learnlng",
-        "Deep Learnlng",
-        "Reinforcement Learnlng",
-    ]
-    
-    for ex in examples:
-        result, _, _, _ = corrector.correct_text(ex, 65.0)
-        print(f"    '{ex}' -> '{result}'")
-
-
-if __name__ == "__main__":
-    # Create template dictionary
-    print("Creating word-level dictionary template...")
-    create_word_level_dictionary("schedule_dictionary.json")
-    
-    # Run tests
-    test_word_level_correction()
-    test_case_preservation()
-    test_punctuation_handling()
-    test_dictionary_efficiency()
+    # Cleanup
+    import os
+    os.remove(test_path)
+    print("\n✓ Tests completed")

@@ -13,10 +13,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 # Import your existing processor
 from start import TableOCRProcessor, setup_logging
+from src.dictionary_optimizer import DictionaryOptimizer
+from src.schedule_pattern_detector import analyze_schedule_patterns
 import logging
 
 # Setup logging with INFO level (less verbose)
@@ -45,15 +47,22 @@ app.add_middleware(
 app.mount("/visualizations", StaticFiles(directory="visualizations"), name="visualizations")
 
 # Response model
-class ProcessingResponse(BaseModel):
+class ProcessingResponse(BaseModel): 
     success: bool
     data: Optional[dict] = None
     error: Optional[str] = None
+
+class SectionCorrection(BaseModel):
+    original_text: str
+    corrected_text: str
+    type: str
+    is_phrase: bool
 
 class CorrectionItem(BaseModel):
     original: str
     corrected: str
     cell_id: Optional[int] = None
+    section_corrections: List[SectionCorrection] = []
 
 class CorrectionsRequest(BaseModel):
     corrections: List[CorrectionItem]
@@ -95,6 +104,10 @@ async def process_file(file: UploadFile = File(...)):
         
         # Process the file
         result = processor.process_file(str(temp_file_path))
+        
+        result = analyze_schedule_patterns({"success": True, "data": result}, verbose=False)
+        # Extract data back from wrapper
+        result = result.get("data", result)
         
         # Quick validation
         dimensions = result.get('table', {}).get('dimensions', {})
@@ -181,134 +194,69 @@ async def cleanup_visualization(filename: str):
 @app.post("/api/save-corrections")
 async def save_corrections(request: CorrectionsRequest):
     """
-    Save text corrections to the OCR dictionary.
+    Save text corrections with section-based tagging.
     """
     try:
-        # Use the correct path for the dictionary
-        dictionary_path = Path("src/ocr_dictionary.json")
+        # Initialize the optimizer
+        optimizer = DictionaryOptimizer()
         
-        # Check if file exists, if not use the one in root
-        if not dictionary_path.exists():
-            dictionary_path = Path("ocr_dictionary.json")
+        # Process section corrections
+        all_corrections = []
         
-        if not dictionary_path.exists():
-            logger.error(f"Dictionary file not found at {dictionary_path}")
+        for correction in request.corrections:
+            # Process section corrections (only edited parts)
+            for section in correction.section_corrections:
+                all_corrections.append({
+                    "original": section.original_text,
+                    "corrected": section.corrected_text,
+                    "type": section.type,
+                    "is_phrase": section.is_phrase
+                })
+        
+        if not all_corrections:
             return JSONResponse(
                 content={
-                    "success": False,
-                    "error": "Dictionary file not found"
+                    "success": True,
+                    "message": "No valid corrections to save",
+                    "stats": {}
                 },
-                status_code=500
+                status_code=200
             )
         
-        logger.info(f"Loading dictionary from {dictionary_path}")
+        logger.info(f"Processing {len(all_corrections)} section corrections")
         
-        # Load the dictionary
-        with open(dictionary_path, 'r', encoding='utf-8') as f:
-            dictionary_data = json.load(f)
+        # Add corrections with proper categorization
+        stats = optimizer.add_word_based_corrections(all_corrections)
         
-        # Initialize structures if they don't exist
-        if "word_corrections" not in dictionary_data:
-            dictionary_data["word_corrections"] = {}
+        logger.info(f"Processing complete: {stats}")
         
-        if "phrase_corrections" not in dictionary_data:
-            dictionary_data["phrase_corrections"] = {}
+        # Prepare detailed response
+        message = f"Successfully processed {len(request.corrections)} cell(s)\n"
+
+        if stats.get("corrections_added", 0) > 0:
+            message += f"Total entries added: {stats['corrections_added']}\n"
         
-        # Track what we're adding
-        added_corrections = []
+        if stats.get("word_corrections_added", 0) > 0:
+            message += f"Word corrections: {stats['word_corrections_added']}\n"
         
-        # Process each correction
-        for correction in request.corrections:
-            original = correction.original.strip()
-            corrected = correction.corrected.strip()
-            
-            # Skip if they're the same or empty
-            if not original or not corrected or original == corrected:
-                continue
-            
-            # Determine if it's a word or phrase correction
-            original_words = original.split()
-            corrected_words = corrected.split()
-            
-            if len(original_words) == 1 and len(corrected_words) == 1:
-                # Single word correction
-                # Check if we need to add this correction
-                existing_corrections = dictionary_data["word_corrections"].get(corrected, [])
-                
-                # Check if the original is already in the list (case-insensitive)
-                already_exists = any(
-                    existing.lower() == original.lower() 
-                    for existing in existing_corrections
-                )
-                
-                if not already_exists:
-                    # Add the correction
-                    if corrected not in dictionary_data["word_corrections"]:
-                        dictionary_data["word_corrections"][corrected] = []
-                    
-                    dictionary_data["word_corrections"][corrected].append(original)
-                    added_corrections.append({
-                        "type": "word",
-                        "original": original,
-                        "corrected": corrected
-                    })
-                    logger.info(f"Added word correction: '{original}' -> '{corrected}'")
-            else:
-                # Multi-word/phrase correction
-                existing_corrections = dictionary_data["phrase_corrections"].get(corrected, [])
-                
-                # Check if already exists
-                already_exists = any(
-                    existing.lower() == original.lower() 
-                    for existing in existing_corrections
-                )
-                
-                if not already_exists:
-                    if corrected not in dictionary_data["phrase_corrections"]:
-                        dictionary_data["phrase_corrections"][corrected] = []
-                    
-                    dictionary_data["phrase_corrections"][corrected].append(original)
-                    added_corrections.append({
-                        "type": "phrase",
-                        "original": original,
-                        "corrected": corrected
-                    })
-                    logger.info(f"Added phrase correction: '{original}' -> '{corrected}'")
+        if stats.get("phrase_corrections_added", 0) > 0:
+            message += f"Phrase corrections: {stats['phrase_corrections_added']}\n"
         
-        # Save the updated dictionary if we added anything
-        if added_corrections:
-            # Sort the corrections for better readability
-            for key in dictionary_data["word_corrections"]:
-                dictionary_data["word_corrections"][key].sort()
-            
-            for key in dictionary_data["phrase_corrections"]:
-                dictionary_data["phrase_corrections"][key].sort()
-            
-            # Save to file
-            with open(dictionary_path, 'w', encoding='utf-8') as f:
-                json.dump(dictionary_data, f, indent=2, ensure_ascii=False)
-            
-            logger.info(f"Successfully saved {len(added_corrections)} corrections to {dictionary_path}")
+        if stats.get("by_type"):
+            message += "\nBy category:\n"
+            for type_name, count in stats["by_type"].items():
+                message += f"  • {type_name}: {count}\n"
         
         return JSONResponse(
             content={
                 "success": True,
-                "corrections_added": len(added_corrections),
-                "details": added_corrections,
-                "message": f"Successfully added {len(added_corrections)} correction(s)"
+                "message": message,
+                "stats": stats,
+                "corrections_processed": len(request.corrections)
             },
             status_code=200
         )
         
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON in dictionary file: {str(e)}")
-        return JSONResponse(
-            content={
-                "success": False,
-                "error": f"Invalid dictionary file format: {str(e)}"
-            },
-            status_code=500
-        )
     except Exception as e:
         logger.error(f"Error saving corrections: {str(e)}", exc_info=True)
         return JSONResponse(
@@ -318,7 +266,6 @@ async def save_corrections(request: CorrectionsRequest):
             },
             status_code=500
         )
-
 
 if __name__ == "__main__":
     import uvicorn
