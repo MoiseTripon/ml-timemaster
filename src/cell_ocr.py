@@ -803,16 +803,16 @@ class CellOCR:
         """Get or create OCR instance."""
         if CellOCR._ocr_instance is not None:
             return CellOCR._ocr_instance
-        
+
         with CellOCR._ocr_init_lock:
             if CellOCR._ocr_instance is not None:
                 return CellOCR._ocr_instance
-            
+
             self.logger.info("Loading PaddleOCR...")
             start = time.time()
-            
+
             from paddleocr import PaddleOCR
-            
+
             try:
                 CellOCR._ocr_instance = PaddleOCR(
                     lang="latin",
@@ -820,29 +820,29 @@ class CellOCR:
 
                     # Detection (good for small printed text)
                     text_det_limit_type="max",
-                    text_det_limit_side_len=1280,
+                    text_det_limit_side_len=1536,
                     text_det_thresh=0.25,
                     text_det_box_thresh=0.55,
-                    text_det_unclip_ratio=1.6,
+                    text_det_unclip_ratio=1.5,
 
                     # Recognition
                     text_rec_score_thresh=0.5,
-                    # Recognition input width (helps prevent truncation on long single-line text)
-                    text_rec_input_shape="3,48,960",
+                    # Wider recognition input to handle long single-line text without truncation
+                    text_rec_input_shape="3,48,1280",
                     text_recognition_batch_size=1,
                 )
             except Exception as e:
                 self.logger.warning(f"Init failed: {e}")
                 CellOCR._ocr_instance = PaddleOCR(lang=self.lang)
-            
+
             self.logger.info(f"PaddleOCR loaded in {time.time()-start:.1f}s")
-        
+
         return CellOCR._ocr_instance
 
     @property
     def ocr(self):
         return self._get_ocr()
-
+    
     def _prepare_image_for_ocr(self, img: np.ndarray) -> np.ndarray:
         """Prepare image for OCR."""
         if len(img.shape) == 2:
@@ -939,12 +939,524 @@ class CellOCR:
         return parsed
 
     def _run_ocr(self, img: np.ndarray) -> Tuple[str, float]:
-        """Run OCR on image."""
+        """Run OCR on image with sliding window for long text."""
         self.stats['ocr_calls'] += 1
-        
+
         try:
             prepared = self._prepare_image_for_ocr(img)
+            h, w = prepared.shape[:2]
+
+            # For wide images (long text), use sliding window recognition
+            # The recognizer degrades badly beyond ~30-40 chars worth of width
+            # Threshold: if width > height * 6 and width > 400px, use sliding window
+            if w > h * 6 and w > 400:
+                sw_text, sw_conf = self._run_ocr_sliding_window(prepared)
+                if sw_text and sw_conf > 20:
+                    # Also try full rec-only for comparison
+                    full_text, full_conf = self._run_ocr_rec_only(prepared)
+
+                    # Also try detection-based
+                    det_text, det_conf = self._run_ocr_with_det(prepared)
+
+                    # Pick the best result based on confidence and text quality
+                    candidates = [
+                        (sw_text, sw_conf, "sliding_window"),
+                        (full_text, full_conf, "rec_only"),
+                        (det_text, det_conf, "det"),
+                    ]
+
+                    best_text, best_conf, best_method = max(
+                        [(t, c, m) for t, c, m in candidates if t],
+                        key=lambda x: self._score_long_text(x[0], x[1]),
+                        default=("", 0.0, "none")
+                    )
+
+                    if self.verbose:
+                        self.logger.debug(f"Long text candidates:")
+                        for t, c, m in candidates:
+                            if t:
+                                self.logger.debug(f"  [{m}] conf={c:.1f} '{t[:80]}...'")
+                        self.logger.debug(f"  Selected: [{best_method}]")
+
+                    return best_text, best_conf
+
+            # Standard path for normal-width cells
+            text, conf = self._run_ocr_with_det(prepared)
+
+            # Fallback for medium-length text with poor results
+            if text and conf < 50 and len(text) > 20:
+                rec_text, rec_conf = self._run_ocr_rec_only(prepared)
+                if rec_text and rec_conf > conf:
+                    return rec_text, rec_conf
+
+            return text, conf
+
+        except Exception as e:
+            self.logger.error(f"OCR error: {e}")
+            return "", 0.0
+
+    def _run_ocr_sliding_window(self, img: np.ndarray) -> Tuple[str, float]:
+        """
+        Run OCR using a sliding window approach for long text.
+        
+        Splits the image into overlapping windows, runs recognition on each,
+        then stitches results together by matching overlapping text regions.
+        
+        Args:
+            img: Prepared BGR image (already scaled appropriately)
             
+        Returns:
+            Tuple of (combined_text, average_confidence)
+        """
+        h, w = img.shape[:2]
+
+        # Window width: aim for ~30 characters worth of pixels
+        # Estimate char width from image height (for typical fonts, char width ≈ 0.5-0.7 * height)
+        estimated_char_width = max(int(h * 0.55), 10)
+        target_chars_per_window = 30
+        window_width = min(estimated_char_width * target_chars_per_window, w)
+
+        # Overlap: ~40% of window width to ensure sufficient text overlap for matching
+        overlap = int(window_width * 0.4)
+
+        # Minimum window width sanity check
+        if window_width < 100:
+            window_width = min(400, w)
+            overlap = int(window_width * 0.4)
+
+        # If image isn't much wider than one window, just do full rec
+        if w <= window_width * 1.3:
+            return self._run_ocr_rec_only(img)
+
+        # Generate window positions
+        stride = window_width - overlap
+        windows = []
+        x = 0
+        while x < w:
+            x_end = min(x + window_width, w)
+            # Don't create tiny trailing windows
+            if x > 0 and (x_end - x) < window_width * 0.4:
+                # Extend previous window or adjust this one
+                x = max(0, w - window_width)
+                x_end = w
+                windows.append((x, x_end))
+                break
+            windows.append((x, x_end))
+            if x_end >= w:
+                break
+            x += stride
+
+        if self.verbose:
+            self.logger.debug(
+                f"Sliding window: img={w}x{h}, window={window_width}, "
+                f"overlap={overlap}, stride={stride}, n_windows={len(windows)}"
+            )
+
+        # Run recognition on each window
+        window_results = []
+        for i, (x_start, x_end) in enumerate(windows):
+            window_img = img[:, x_start:x_end].copy()
+
+            # Ensure the window image is contiguous
+            if not window_img.flags['C_CONTIGUOUS']:
+                window_img = np.ascontiguousarray(window_img)
+
+            text, conf = self._run_ocr_rec_only(window_img)
+
+            if not text:
+                # Try with detection as fallback for this window
+                text, conf = self._run_ocr_with_det(window_img)
+
+            window_results.append({
+                'text': text or "",
+                'conf': conf,
+                'x_start': x_start,
+                'x_end': x_end,
+                'index': i,
+            })
+
+            if self.verbose:
+                self.logger.debug(f"  Window {i} [{x_start}:{x_end}]: conf={conf:.1f} '{text}'")
+
+        # Stitch windows together using overlap matching
+        combined_text, avg_conf = self._stitch_window_results(window_results, overlap, window_width)
+
+        return combined_text, avg_conf
+
+    def _stitch_window_results(
+        self,
+        window_results: List[Dict[str, Any]],
+        overlap_pixels: int,
+        window_width: int
+    ) -> Tuple[str, float]:
+        """
+        Stitch sliding window OCR results by matching overlapping text.
+        
+        For each pair of adjacent windows, the overlap region produces text
+        in both windows. We find the best alignment between the suffix of
+        window N and the prefix of window N+1, then merge accordingly.
+        
+        Args:
+            window_results: List of window OCR results
+            overlap_pixels: Pixel overlap between windows
+            window_width: Total window width in pixels
+            
+        Returns:
+            Tuple of (stitched_text, average_confidence)
+        """
+        if not window_results:
+            return "", 0.0
+
+        # Filter out empty results but keep position info
+        valid_results = [r for r in window_results if r['text'].strip()]
+
+        if not valid_results:
+            return "", 0.0
+
+        if len(valid_results) == 1:
+            return valid_results[0]['text'], valid_results[0]['conf']
+
+        # Estimate what fraction of the text comes from the overlap region
+        overlap_fraction = overlap_pixels / window_width if window_width > 0 else 0.4
+
+        combined_text = valid_results[0]['text']
+        total_conf = valid_results[0]['conf']
+        conf_count = 1
+
+        for i in range(1, len(valid_results)):
+            prev_text = combined_text
+            curr_text = valid_results[i]['text']
+            curr_conf = valid_results[i]['conf']
+
+            if not curr_text.strip():
+                continue
+
+            # Estimate overlap in characters
+            # The overlap region appears in both the end of prev_text and start of curr_text
+            estimated_overlap_chars = max(
+                int(len(curr_text) * overlap_fraction),
+                int(len(prev_text) * overlap_fraction),
+                3  # minimum overlap to search for
+            )
+
+            # Find the best merge point
+            merged = self._find_overlap_and_merge(prev_text, curr_text, estimated_overlap_chars)
+
+            combined_text = merged
+            total_conf += curr_conf
+            conf_count += 1
+
+        avg_conf = total_conf / conf_count if conf_count > 0 else 0.0
+
+        return combined_text.strip(), avg_conf
+
+    def _find_overlap_and_merge(
+        self,
+        text_a: str,
+        text_b: str,
+        estimated_overlap_chars: int
+    ) -> str:
+        """
+        Find overlapping text between the suffix of text_a and prefix of text_b,
+        then merge them.
+        
+        Uses multiple strategies:
+        1. Exact substring matching
+        2. Fuzzy matching with SequenceMatcher
+        3. Character-level alignment
+        
+        Args:
+            text_a: First text (we keep the beginning)
+            text_b: Second text (we keep the end)
+            estimated_overlap_chars: Estimated number of overlapping characters
+            
+        Returns:
+            Merged text
+        """
+        if not text_a:
+            return text_b
+        if not text_b:
+            return text_a
+
+        # Search range: look at more than the estimated overlap to be safe
+        search_len_a = min(len(text_a), int(estimated_overlap_chars * 1.8) + 10)
+        search_len_b = min(len(text_b), int(estimated_overlap_chars * 1.8) + 10)
+
+        suffix_a = text_a[-search_len_a:]  # End of first window
+        prefix_b = text_b[:search_len_b]   # Start of second window
+
+        # Strategy 1: Find longest exact substring match
+        best_match_len = 0
+        best_a_end = len(text_a)
+        best_b_start = 0
+
+        # Try matching suffix of A with prefix of B
+        min_match = max(3, estimated_overlap_chars // 3)
+
+        for match_len in range(min(len(suffix_a), len(prefix_b)), min_match - 1, -1):
+            suffix_end = suffix_a[-match_len:]
+            prefix_start = prefix_b[:match_len]
+
+            if suffix_end == prefix_start:
+                best_match_len = match_len
+                best_a_end = len(text_a)  # Keep all of A
+                best_b_start = match_len  # Skip matched part of B
+                break
+
+        if best_match_len >= min_match:
+            merged = text_a[:best_a_end] + text_b[best_b_start:]
+            if self.verbose:
+                self.logger.debug(
+                    f"  Exact overlap match ({best_match_len} chars): "
+                    f"'{suffix_a[-best_match_len:]}'"
+                )
+            return merged
+
+        # Strategy 2: Fuzzy matching - find best alignment
+        best_ratio = 0.0
+        best_split_a = len(text_a)
+        best_split_b = 0
+
+        # Try different split points
+        min_overlap = max(3, estimated_overlap_chars // 4)
+        max_overlap = min(len(suffix_a), len(prefix_b), estimated_overlap_chars * 2)
+
+        for overlap_len in range(min_overlap, max_overlap + 1):
+            # Compare end of A with start of B
+            a_segment = text_a[-(overlap_len):]
+            b_segment = text_b[:overlap_len]
+
+            # Quick length filter
+            if abs(len(a_segment) - len(b_segment)) > max(3, overlap_len * 0.3):
+                continue
+
+            ratio = SequenceMatcher(None, a_segment.lower(), b_segment.lower()).ratio()
+
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_split_a = len(text_a) - overlap_len
+                best_split_b = overlap_len
+
+        # Accept fuzzy match if similarity is high enough
+        if best_ratio >= 0.55:
+            # Decide which version of the overlap to keep based on confidence
+            # Generally prefer the version from the window with higher confidence
+            # For simplicity, keep text_a's version up to the split point
+            merged = text_a[:len(text_a)] + text_b[best_split_b:]
+
+            if self.verbose:
+                overlap_a = text_a[best_split_a:]
+                overlap_b = text_b[:best_split_b]
+                self.logger.debug(
+                    f"  Fuzzy overlap match (ratio={best_ratio:.2f}): "
+                    f"A='{overlap_a}' vs B='{overlap_b}'"
+                )
+
+            # If the overlap from A and B are very different, try character-level merge
+            if best_ratio < 0.75:
+                overlap_a = text_a[best_split_a:]
+                overlap_b = text_b[:best_split_b]
+                better_overlap = self._pick_better_overlap(overlap_a, overlap_b)
+                merged = text_a[:best_split_a] + better_overlap + text_b[best_split_b:]
+
+            return merged
+
+        # Strategy 3: No good overlap found
+        # This might mean the windows captured completely different text regions
+        # or the overlap estimation was wrong. 
+        # Try a smaller overlap search with word boundaries
+        word_merge = self._try_word_boundary_merge(text_a, text_b, estimated_overlap_chars)
+        if word_merge:
+            return word_merge
+
+        # Last resort: just concatenate with a space, removing likely duplicated end/start
+        # Trim a small portion that's likely garbled overlap
+        trim_chars = max(2, estimated_overlap_chars // 3)
+        if len(text_a) > trim_chars:
+            trimmed = text_a[:-trim_chars] + " " + text_b[trim_chars:]
+        else:
+            trimmed = text_a + " " + text_b
+
+        if self.verbose:
+            self.logger.debug(
+                f"  No overlap found, concatenating with trim ({trim_chars} chars)"
+            )
+
+        return trimmed
+
+    def _pick_better_overlap(self, overlap_a: str, overlap_b: str) -> str:
+        """
+        Pick the better version of overlapping text based on text quality heuristics.
+        
+        Prefers text with:
+        - More alphabetic characters
+        - Fewer repeated characters
+        - More spaces (word separators)
+        - Fewer suspicious patterns
+        """
+        def score_text(t: str) -> float:
+            if not t:
+                return 0.0
+            s = 0.0
+            # Prefer more alpha chars
+            alpha_ratio = sum(1 for c in t if c.isalpha()) / len(t)
+            s += alpha_ratio * 10
+
+            # Prefer spaces (indicates word separation)
+            space_ratio = t.count(' ') / max(len(t), 1)
+            s += space_ratio * 5
+
+            # Penalize repeated characters (sign of garbled text)
+            for i in range(len(t) - 2):
+                if t[i] == t[i+1] == t[i+2]:
+                    s -= 3
+
+            # Penalize all-caps runs > 10 chars without spaces (likely garbled)
+            caps_run = 0
+            for c in t:
+                if c.isupper():
+                    caps_run += 1
+                    if caps_run > 10:
+                        s -= 1
+                else:
+                    caps_run = 0
+
+            return s
+
+        score_a = score_text(overlap_a)
+        score_b = score_text(overlap_b)
+
+        if self.verbose:
+            self.logger.debug(
+                f"  Overlap quality: A({score_a:.1f})='{overlap_a}' vs B({score_b:.1f})='{overlap_b}'"
+            )
+
+        return overlap_a if score_a >= score_b else overlap_b
+
+    def _try_word_boundary_merge(
+        self,
+        text_a: str,
+        text_b: str,
+        estimated_overlap_chars: int
+    ) -> Optional[str]:
+        """
+        Try to merge texts by finding matching words at the boundary.
+        
+        Looks for common words between the end of text_a and start of text_b.
+        """
+        words_a = text_a.split()
+        words_b = text_b.split()
+
+        if not words_a or not words_b:
+            return None
+
+        # Look for matching words in the overlap region
+        # Check last N words of A against first N words of B
+        max_words_to_check = max(2, estimated_overlap_chars // 4)
+        search_words_a = words_a[-max_words_to_check:]
+        search_words_b = words_b[:max_words_to_check]
+
+        best_word_match = 0
+        best_a_word_idx = len(words_a)
+        best_b_word_idx = 0
+
+        for i, word_a in enumerate(search_words_a):
+            for j, word_b in enumerate(search_words_b):
+                # Check for exact word match
+                if word_a.lower() == word_b.lower() and len(word_a) >= 3:
+                    # Found matching word - check if subsequent words also match
+                    match_count = 1
+                    ai = len(words_a) - len(search_words_a) + i
+                    bi = j
+
+                    while (ai + match_count < len(words_a) and
+                        bi + match_count < len(words_b)):
+                        if words_a[ai + match_count].lower() == words_b[bi + match_count].lower():
+                            match_count += 1
+                        else:
+                            break
+
+                    if match_count > best_word_match:
+                        best_word_match = match_count
+                        best_a_word_idx = ai
+                        best_b_word_idx = bi + match_count
+
+                # Check for fuzzy word match (handles minor OCR differences)
+                elif len(word_a) >= 3 and len(word_b) >= 3:
+                    ratio = SequenceMatcher(None, word_a.lower(), word_b.lower()).ratio()
+                    if ratio >= 0.75:
+                        ai = len(words_a) - len(search_words_a) + i
+                        if best_word_match == 0:
+                            best_word_match = 1
+                            best_a_word_idx = ai
+                            best_b_word_idx = j + 1
+
+        if best_word_match > 0:
+            # Merge at word boundary
+            merged_words = words_a[:best_a_word_idx + best_word_match] + words_b[best_b_word_idx:]
+            merged = " ".join(merged_words)
+
+            if self.verbose:
+                self.logger.debug(
+                    f"  Word boundary merge: matched {best_word_match} word(s) "
+                    f"at A[{best_a_word_idx}], B[{best_b_word_idx - best_word_match}]"
+                )
+
+            return merged
+
+        return None
+
+    def _score_long_text(self, text: str, confidence: float) -> float:
+        """
+        Score a long text result for comparison between methods.
+        
+        Considers:
+        - Confidence
+        - Text length (longer is generally better for long text cells)
+        - Text quality (spaces, alpha chars, etc.)
+        """
+        if not text:
+            return 0.0
+
+        score = confidence
+
+        # Reward reasonable length
+        text_len = len(text.strip())
+        if text_len > 10:
+            score += min(text_len * 0.3, 20)
+
+        # Reward word separations (spaces)
+        word_count = len(text.split())
+        if word_count > 1:
+            score += min(word_count * 2, 15)
+
+        # Penalize garbled text indicators
+        # - Many consecutive same characters
+        for i in range(len(text) - 2):
+            if text[i] == text[i+1] == text[i+2] and text[i].isalpha():
+                score -= 5
+
+        # - Very few spaces relative to length
+        if text_len > 20 and word_count < text_len // 20:
+            score -= 15
+
+        # - Too many uppercase without spaces (garbled)
+        upper_run = 0
+        max_upper_run = 0
+        for c in text:
+            if c.isupper():
+                upper_run += 1
+                max_upper_run = max(max_upper_run, upper_run)
+            else:
+                upper_run = 0
+        if max_upper_run > 15:
+            score -= 10
+
+        return score
+
+    def _run_ocr_with_det(self, prepared: np.ndarray) -> Tuple[str, float]:
+        """Run OCR with detection enabled (standard mode)."""
+        try:
             try:
                 result = self.ocr.ocr(prepared)
             except TypeError:
@@ -952,24 +1464,84 @@ class CellOCR:
                     result = self.ocr.ocr(prepared, det=True, rec=True, cls=False)
                 except:
                     return "", 0.0
-            
+
             parsed = self._parse_paddle_result(result)
             if not parsed:
                 return "", 0.0
-            
+
             texts = [t for t, c in parsed]
             confs = [c for t, c in parsed]
             combined = " ".join(texts)
-            
+
             total_len = sum(len(t) for t in texts)
             avg_conf = sum(c * len(t) for c, t in zip(confs, texts)) / total_len if total_len else 0
-            
+
             return combined, avg_conf * 100
-            
+
         except Exception as e:
-            self.logger.error(f"OCR error: {e}")
+            self.logger.error(f"OCR with det error: {e}")
             return "", 0.0
 
+    def _run_ocr_rec_only(self, prepared: np.ndarray) -> Tuple[str, float]:
+        """
+        Run OCR in recognition-only mode (no detection).
+        Treats the entire image as a single text region.
+        """
+        try:
+            try:
+                result = self.ocr.ocr(prepared, det=False, rec=True, cls=False)
+            except TypeError:
+                try:
+                    result = self.ocr.ocr(prepared, det=False, rec=True)
+                except:
+                    return "", 0.0
+
+            if result is None:
+                return "", 0.0
+
+            text = ""
+            conf = 0.0
+
+            if isinstance(result, list):
+                for item in result:
+                    if item is None:
+                        continue
+
+                    if isinstance(item, list):
+                        for sub_item in item:
+                            if isinstance(sub_item, (list, tuple)) and len(sub_item) >= 2:
+                                t, c = str(sub_item[0]).strip(), float(sub_item[1])
+                                if t and 0 <= c <= 1:
+                                    if len(t) > len(text):
+                                        text = t
+                                        conf = c
+                            elif isinstance(sub_item, dict):
+                                t = str(sub_item.get('text', sub_item.get('rec_text', ''))).strip()
+                                c = float(sub_item.get('score', sub_item.get('rec_score', 0)))
+                                if t and len(t) > len(text):
+                                    text = t
+                                    conf = c
+
+                    elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                        t, c = str(item[0]).strip(), float(item[1])
+                        if t and 0 <= c <= 1:
+                            if len(t) > len(text):
+                                text = t
+                                conf = c
+
+                    elif isinstance(item, dict):
+                        t = str(item.get('text', item.get('rec_text', ''))).strip()
+                        c = float(item.get('score', item.get('rec_score', 0)))
+                        if t and len(t) > len(text):
+                            text = t
+                            conf = c
+
+            return text, conf * 100
+
+        except Exception as e:
+            self.logger.error(f"OCR rec-only error: {e}")
+            return "", 0.0
+        
     def _preprocess(self, img: np.ndarray, method: int = 0) -> np.ndarray:
         """Apply preprocessing."""
         if len(img.shape) == 2:
