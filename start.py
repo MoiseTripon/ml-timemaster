@@ -152,10 +152,14 @@ class TableOCRProcessor:
                     self.logger.error(f"[TableOCRProcessor] Error processing cell {idx}: {str(ocr_error)}")
 
             # Log summary of extracted text
-            texts_found = [c["text"] for c in result["cells"] if c["text"].strip()]
+            texts_found = [
+                                (c.get("text") or "")
+                                for c in result["cells"]
+                                if isinstance(c.get("text"), str) and c.get("text").strip()
+                            ]
             self.logger.info(f"[TableOCRProcessor] Extracted {len(texts_found)} non-empty texts")
             if texts_found:
-                self.logger.info(f"[TableOCRProcessor] Sample texts: {texts_found[:3]}")
+                self.logger.info(f"[TableOCRProcessor] Sample texts: {texts_found[:3]}") 
 
             # Step 4: Organize cells into grid structure
             grid, num_rows, num_cols = self.grid_builder.organize_cells_into_grid(result["cells"])
@@ -183,11 +187,12 @@ class TableOCRProcessor:
                     "output_file": f"detected_table_{os.path.splitext(os.path.basename(file_path))[0]}.png"
                 },
             }
-
+            try:
             # # Step 6: Create visualization
-            self._create_visualization(original_img, table_bounds, result["cells"], 
+                self._create_visualization(original_img, table_bounds, result["cells"], 
                                       response["visualization"]["output_file"], num_rows, num_cols)
-                
+            except Exception as e:
+                print (e)
             return response
 
         except Exception as e:
